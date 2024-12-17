@@ -67,10 +67,6 @@ func main() {
 	engine.Reload(true)
 	app := fiber.New(fiber.Config{Views: engine})
 	app.Static("/", "./static")
-	app.Use(func(ctx *fiber.Ctx) error {
-		fmt.Println(ctx.Path(), ctx.Method())
-		return ctx.Next()
-	})
 	app.Get("/login", func(ctx *fiber.Ctx) error {
 		return ctx.Render("login", fiber.Map{
 			"LogoURL": srv.Config.CompanyLogoFile,
@@ -130,7 +126,23 @@ func handleAuthorize(ctx *fiber.Ctx, srv *server.Server) error {
 	if err != nil {
 		return err
 	}
-	if v, ok := sessionStore.Get("ReturnUri").([]byte); ok {
+	v, ok := sessionStore.Get("ReturnUri").([]byte)
+	if ctx.Method() == fiber.MethodPost {
+		consent := ctx.FormValue("consent")
+		if srv.Config.RequiredConsent && consent != "allow" {
+			redirectURi := "/login"
+			if v != nil {
+				var mp map[string]any
+				err = json.Unmarshal(v, &mp)
+				if err == nil {
+					redirectURi = mp["redirect_uri"].(string) + "?error=request_cancelled"
+				}
+			}
+			return ctx.Redirect(redirectURi, fiber.StatusFound)
+		}
+		sessionStore.Set("consent", consent)
+	}
+	if ok {
 		ctx.Request().SetBody(v)
 	}
 	sessionStore.Delete("ReturnUri")

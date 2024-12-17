@@ -19,13 +19,18 @@
         The client would like to perform actions on your behalf. Do you allow this?
     </p>
     <form action="/oauth/authorize" method="POST" class="flex flex-col items-center space-y-4">
-        <button
-                type="submit"
-                class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 text-sm font-medium"
-        >
-            Allow
-        </button>
-        <a href="/" class="text-blue-600 hover:underline text-sm">Cancel</a>
+        <div class="flex justify-between w-full mb-4 gap-3">
+            <button type="submit" name="consent" value="allow"
+                    class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 text-sm font-medium"
+            >
+                Allow
+            </button>
+            <button type="submit" name="consent" value="cancel"
+                    class="w-full bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 text-sm font-medium"
+            >
+                Cancel
+            </button>
+        </div>
     </form>
 </div>
 </body>
