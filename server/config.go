@@ -17,6 +17,7 @@ type Config struct {
 	AllowedGrantTypes           []oauth2.GrantType    // allow the grant type
 	AllowedCodeChallengeMethods []oauth2.CodeChallengeMethod
 	ForcePKCE                   bool
+	RequiredConsent             bool
 }
 
 // NewConfig create to configuration instance
@@ -34,6 +35,7 @@ func NewConfig() *Config {
 			oauth2.CodeChallengePlain,
 			oauth2.CodeChallengeS256,
 		},
+		RequiredConsent: true,
 	}
 }
 

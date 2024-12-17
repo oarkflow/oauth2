@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"time"
@@ -34,8 +33,6 @@ var (
 )
 
 func main() {
-	flag.Parse()
-
 	manager := manage.NewDefaultManager()
 	manager.SetAuthorizeCodeTokenCfg(manage.DefaultAuthorizeCodeTokenCfg)
 	manager.MustTokenStorage(store.NewMemoryTokenStore())
@@ -70,13 +67,31 @@ func main() {
 	engine.Reload(true)
 	app := fiber.New(fiber.Config{Views: engine})
 	app.Static("/", "./static")
+	app.Use(func(ctx *fiber.Ctx) error {
+		fmt.Println(ctx.Path(), ctx.Method())
+		return ctx.Next()
+	})
 	app.Get("/login", func(ctx *fiber.Ctx) error {
-
 		return ctx.Render("login", fiber.Map{
 			"LogoURL": srv.Config.CompanyLogoFile,
 		})
 	})
-	app.Post("/login", loginPostHandler)
+	app.Post("/login", func(ctx *fiber.Ctx) error {
+		sessionStore, err := sess.Get(ctx)
+		if err != nil {
+			return err
+		}
+		data, err := server.ParseRequest[models.Identity](ctx)
+		if err != nil {
+			return err
+		}
+		sessionStore.Set("LoggedInUserID", data.Username)
+		_ = sessionStore.Save()
+		if !srv.Config.RequiredConsent {
+			return handleAuthorize(ctx, srv)
+		}
+		return ctx.Redirect("/auth", fiber.StatusFound)
+	})
 	app.All("/auth", func(ctx *fiber.Ctx) error {
 		sessionStore, err := sess.Get(ctx)
 		if err != nil {
@@ -90,16 +105,7 @@ func main() {
 		})
 	})
 	app.All("/oauth/authorize", func(ctx *fiber.Ctx) error {
-		sessionStore, err := sess.Get(ctx)
-		if err != nil {
-			return err
-		}
-		if v, ok := sessionStore.Get("ReturnUri").([]byte); ok {
-			ctx.Request().SetBody(v)
-		}
-		sessionStore.Delete("ReturnUri")
-		_ = sessionStore.Save()
-		return srv.HandleAuthorizeRequest(ctx)
+		return handleAuthorize(ctx, srv)
 	})
 	app.All("/oauth/token", srv.HandleTokenRequest)
 
@@ -119,12 +125,24 @@ func main() {
 	_ = app.Listen(fmt.Sprintf(":%d", port))
 }
 
+func handleAuthorize(ctx *fiber.Ctx, srv *server.Server) error {
+	sessionStore, err := sess.Get(ctx)
+	if err != nil {
+		return err
+	}
+	if v, ok := sessionStore.Get("ReturnUri").([]byte); ok {
+		ctx.Request().SetBody(v)
+	}
+	sessionStore.Delete("ReturnUri")
+	_ = sessionStore.Save()
+	return srv.HandleAuthorizeRequest(ctx)
+}
+
 func userAuthorizeHandler(ctx *fiber.Ctx) (userID string, err error) {
 	sessionStore, err := sess.Get(ctx)
 	if err != nil {
 		return
 	}
-
 	uid, ok := sessionStore.Get("LoggedInUserID").(string)
 	if !ok {
 		data, err := server.ParseRequest[models.AuthResponse](ctx)
@@ -139,18 +157,4 @@ func userAuthorizeHandler(ctx *fiber.Ctx) (userID string, err error) {
 	sessionStore.Delete("LoggedInUserID")
 	_ = sessionStore.Save()
 	return
-}
-
-func loginPostHandler(ctx *fiber.Ctx) error {
-	sessionStore, err := sess.Get(ctx)
-	if err != nil {
-		return err
-	}
-	data, err := server.ParseRequest[models.Identity](ctx)
-	if err != nil {
-		return err
-	}
-	sessionStore.Set("LoggedInUserID", data.Username)
-	_ = sessionStore.Save()
-	return ctx.Redirect("/auth", fiber.StatusFound)
 }

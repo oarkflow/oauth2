@@ -40,7 +40,9 @@ func main() {
 		}
 		token, err := oauth2Client.ExchangeToken(context.Background(), code, codeVerifier)
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": err.Error(),
+			})
 		}
 		oauth2Client.SetToken(token)
 		return c.JSON(token)
