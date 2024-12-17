@@ -10,6 +10,7 @@ import (
 
 // Config configuration parameters
 type Config struct {
+	CompanyLogoFile             string
 	TokenType                   string                // token type
 	AllowGetAccessRequest       bool                  // to allow "GET" requests for the token
 	AllowedResponseTypes        []oauth2.ResponseType // allow the authorization type

@@ -12,6 +12,8 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
+
+	"github.com/oarkflow/oauth2/errors"
 )
 
 func New(serverURL, clientBaseURL string, config oauth2.Config) *Client {
@@ -65,11 +67,14 @@ func (c *Client) ClientCredentialsToken(ctx context.Context) (*oauth2.Token, err
 }
 
 // Request performs a request with the specified HTTP method, headers, and body
-func (c *Client) Request(ctx context.Context, token *oauth2.Token, method, endpoint string, headers map[string]string, body []byte) (*http.Response, error) {
+func (c *Client) Request(ctx context.Context, method, endpoint string, headers map[string]string, body []byte) (*http.Response, error) {
+	if c.token == nil {
+		return nil, errors.ErrInvalidToken
+	}
 	if !HasScheme(endpoint) {
 		endpoint = c.serverURL + endpoint
 	}
-	client := c.cfg.Client(ctx, token)
+	client := c.cfg.Client(ctx, c.token)
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -81,47 +86,42 @@ func (c *Client) Request(ctx context.Context, token *oauth2.Token, method, endpo
 }
 
 // GET performs a GET request to the specified endpoint
-func (c *Client) GET(ctx context.Context, token *oauth2.Token, endpoint string, headers map[string]string) (string, error) {
-	resp, err := c.Request(ctx, token, http.MethodGet, endpoint, headers, nil)
-	defer resp.Body.Close()
-	return readResponseBody(resp.Body, err)
+func (c *Client) GET(ctx context.Context, endpoint string, headers map[string]string) (string, error) {
+	resp, err := c.Request(ctx, http.MethodGet, endpoint, headers, nil)
+	return readResponseBody(resp, err)
 }
 
 // POST performs a POST request to the specified endpoint
-func (c *Client) POST(ctx context.Context, token *oauth2.Token, endpoint string, headers map[string]string, body []byte) (string, error) {
-	resp, err := c.Request(ctx, token, http.MethodPost, endpoint, headers, body)
-	defer resp.Body.Close()
-	return readResponseBody(resp.Body, err)
+func (c *Client) POST(ctx context.Context, endpoint string, headers map[string]string, body []byte) (string, error) {
+	resp, err := c.Request(ctx, http.MethodPost, endpoint, headers, body)
+	return readResponseBody(resp, err)
 }
 
 // PUT performs a PUT request to the specified endpoint
-func (c *Client) PUT(ctx context.Context, token *oauth2.Token, endpoint string, headers map[string]string, body []byte) (string, error) {
-	resp, err := c.Request(ctx, token, http.MethodPut, endpoint, headers, body)
-	defer resp.Body.Close()
-	return readResponseBody(resp.Body, err)
+func (c *Client) PUT(ctx context.Context, endpoint string, headers map[string]string, body []byte) (string, error) {
+	resp, err := c.Request(ctx, http.MethodPut, endpoint, headers, body)
+	return readResponseBody(resp, err)
 }
 
 // PATCH performs a PATCH request to the specified endpoint
-func (c *Client) PATCH(ctx context.Context, token *oauth2.Token, endpoint string, headers map[string]string, body []byte) (string, error) {
-	resp, err := c.Request(ctx, token, http.MethodPatch, endpoint, headers, body)
-	defer resp.Body.Close()
-	return readResponseBody(resp.Body, err)
+func (c *Client) PATCH(ctx context.Context, endpoint string, headers map[string]string, body []byte) (string, error) {
+	resp, err := c.Request(ctx, http.MethodPatch, endpoint, headers, body)
+	return readResponseBody(resp, err)
 }
 
 // DELETE performs a DELETE request to the specified endpoint
-func (c *Client) DELETE(ctx context.Context, token *oauth2.Token, endpoint string, headers map[string]string) (string, error) {
-	resp, err := c.Request(ctx, token, http.MethodDelete, endpoint, headers, nil)
-	defer resp.Body.Close()
-	return readResponseBody(resp.Body, err)
+func (c *Client) DELETE(ctx context.Context, endpoint string, headers map[string]string) (string, error) {
+	resp, err := c.Request(ctx, http.MethodDelete, endpoint, headers, nil)
+	return readResponseBody(resp, err)
 }
 
 // Helper function to read response body
-func readResponseBody(body io.Reader, err error) (string, error) {
+func readResponseBody(resp *http.Response, err error) (string, error) {
 	if err != nil {
 		return "", err
 	}
 	buf := new(strings.Builder)
-	_, err = io.Copy(buf, body)
+	_, err = io.Copy(buf, resp.Body)
 	if err != nil {
 		return "", err
 	}

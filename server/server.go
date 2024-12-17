@@ -16,22 +16,17 @@ import (
 	"github.com/oarkflow/oauth2/models"
 )
 
-var DefaultIssuer = "Oauth2"
-
 // NewServer create authorization server
-func NewServer(cfg *Config, manager oauth2.Manager) *Server {
+func NewServer(issuer string, cfg *Config, manager oauth2.Manager) *Server {
 	srv := &Server{
+		Issuer:  issuer,
 		Config:  cfg,
 		Manager: manager,
 	}
-
-	// default handler
 	srv.ClientInfoHandler = ClientFormHandler
-
 	srv.UserAuthorizationHandler = func(ctx *fiber.Ctx) (string, error) {
 		return "", errors.ErrAccessDenied
 	}
-
 	srv.PasswordAuthorizationHandler = func(ctx context.Context, clientID, username, password string) (string, error) {
 		return "", errors.ErrAccessDenied
 	}
@@ -40,6 +35,7 @@ func NewServer(cfg *Config, manager oauth2.Manager) *Server {
 
 // Server Provide authorization server
 type Server struct {
+	Issuer                       string
 	Config                       *Config
 	Manager                      oauth2.Manager
 	ClientInfoHandler            ClientInfoHandler
@@ -62,7 +58,6 @@ func (s *Server) handleError(req *AuthorizeRequest, err error) error {
 	if fn := s.PreRedirectErrorHandler; fn != nil {
 		return fn(req, err)
 	}
-
 	return s.redirectError(req, err)
 }
 
@@ -70,7 +65,6 @@ func (s *Server) redirectError(req *AuthorizeRequest, err error) error {
 	if req == nil {
 		return err
 	}
-
 	data, _, _ := s.GetErrorData(err)
 	return s.redirect(req, data)
 }
@@ -95,11 +89,9 @@ func (s *Server) token(ctx *fiber.Ctx, data map[string]interface{}, header http.
 	ctx.Set("Content-Type", "application/json;charset=UTF-8")
 	ctx.Set("Cache-Control", "no-store")
 	ctx.Set("Pragma", "no-cache")
-
 	for key := range header {
 		ctx.Set(key, header.Get(key))
 	}
-
 	status := fiber.StatusOK
 	if len(statusCode) > 0 && statusCode[0] > 0 {
 		status = statusCode[0]
@@ -114,16 +106,13 @@ func (s *Server) GetRedirectURI(req *AuthorizeRequest, data map[string]interface
 	if err != nil {
 		return "", err
 	}
-
 	q := u.Query()
 	if req.State != "" {
 		q.Set("state", req.State)
 	}
-
 	for k, v := range data {
 		q.Set(k, fmt.Sprint(v))
 	}
-
 	switch req.ResponseType {
 	case oauth2.Code:
 		u.RawQuery = q.Encode()
@@ -135,7 +124,6 @@ func (s *Server) GetRedirectURI(req *AuthorizeRequest, data map[string]interface
 		}
 		u.Fragment = fragment
 	}
-
 	return u.String(), nil
 }
 
@@ -176,22 +164,18 @@ func (s *Server) ValidationAuthorizeRequest(ctx *fiber.Ctx) (*AuthorizeRequest, 
 	} else if allowed := s.CheckResponseType(data.ResponseType); !allowed {
 		return nil, errors.ErrUnauthorizedClient
 	}
-
 	if data.CodeChallenge == "" && s.Config.ForcePKCE {
 		return nil, errors.ErrCodeChallengeRquired
 	}
 	if data.CodeChallenge != "" && (len(data.CodeChallenge) < 43 || len(data.CodeChallenge) > 128) {
 		return nil, errors.ErrInvalidCodeChallengeLen
 	}
-
-	// set default
 	if data.CodeChallengeMethod == "" {
 		data.CodeChallengeMethod = oauth2.CodeChallengePlain
 	}
 	if data.CodeChallengeMethod != "" && !s.CheckCodeChallengeMethod(data.CodeChallengeMethod) {
 		return nil, errors.ErrUnsupportedCodeChallengeMethod
 	}
-
 	req := &AuthorizeRequest{
 		RedirectURI:         data.RedirectUri,
 		ResponseType:        data.ResponseType,
@@ -213,7 +197,6 @@ func (s *Server) GetAuthorizeToken(ctx context.Context, req *AuthorizeRequest) (
 		if req.ResponseType == oauth2.Token {
 			gt = oauth2.Implicit
 		}
-
 		allowed, err := fn(req.ClientID, gt)
 		if err != nil {
 			return nil, err
@@ -221,7 +204,6 @@ func (s *Server) GetAuthorizeToken(ctx context.Context, req *AuthorizeRequest) (
 			return nil, errors.ErrUnauthorizedClient
 		}
 	}
-
 	tgr := &oauth2.TokenGenerateRequest{
 		ClientID:       req.ClientID,
 		UserID:         req.UserID,
@@ -230,7 +212,6 @@ func (s *Server) GetAuthorizeToken(ctx context.Context, req *AuthorizeRequest) (
 		AccessTokenExp: req.AccessTokenExp,
 		Request:        req.Request,
 	}
-
 	// check the client allows the authorized scope
 	if fn := s.ClientScopeHandler; fn != nil {
 		allowed, err := fn(tgr)
@@ -240,10 +221,8 @@ func (s *Server) GetAuthorizeToken(ctx context.Context, req *AuthorizeRequest) (
 			return nil, errors.ErrInvalidScope
 		}
 	}
-
 	tgr.CodeChallenge = req.CodeChallenge
 	tgr.CodeChallengeMethod = req.CodeChallengeMethod
-
 	return s.Manager.GenerateAuthToken(ctx, req.ResponseType, tgr)
 }
 
@@ -358,7 +337,7 @@ func (s *Server) ValidationTokenRequest(ctx *fiber.Ctx) (oauth2.GrantType, *oaut
 		tgr.UserID = userID
 	case oauth2.ClientCredentials:
 		tgr.Scope = data.Scope
-		tgr.Issuer = DefaultIssuer
+		tgr.Issuer = s.Issuer
 	case oauth2.Refreshing:
 		tgr.Refresh = data.RefreshToken
 		tgr.Scope = data.Scope
@@ -566,7 +545,6 @@ func (s *Server) BearerAuth(ctx *fiber.Ctx) (string, bool) {
 
 func (s *Server) ValidationBearerToken(ctx *fiber.Ctx) (oauth2.TokenInfo, error) {
 	accessToken, ok := s.BearerAuth(ctx)
-	fmt.Println(accessToken)
 	if !ok {
 		return nil, errors.ErrInvalidAccessToken
 	}

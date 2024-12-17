@@ -10,6 +10,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/session"
+	"github.com/gofiber/template/html/v2"
 
 	"github.com/oarkflow/oauth2/errors"
 	"github.com/oarkflow/oauth2/generates"
@@ -19,22 +20,18 @@ import (
 	"github.com/oarkflow/oauth2/store"
 )
 
-var (
-	dumpvar   bool
-	idvar     string
-	secretvar string
-	domainvar string
-	portvar   int
-	sess      = session.New()
-)
-
-func init() {
-	flag.BoolVar(&dumpvar, "d", true, "Dump requests and responses")
-	flag.StringVar(&idvar, "i", "222222", "The client id being passed in")
-	flag.StringVar(&secretvar, "s", "22222222", "The client secret being passed in")
-	flag.StringVar(&domainvar, "r", "http://localhost:9094", "The domain of the redirect url")
-	flag.IntVar(&portvar, "p", 9096, "the base port for the server")
+var clients = map[string]*models.Client{
+	"222222": {
+		ID:     "222222",
+		Secret: "22222222",
+		Domain: "http://localhost:9094",
+	},
 }
+
+var (
+	port = 9096
+	sess = session.New()
+)
 
 func main() {
 	flag.Parse()
@@ -45,13 +42,12 @@ func main() {
 	manager.MapAccessGenerate(generates.NewAccessGenerate())
 
 	clientStore := store.NewClientStore()
-	_ = clientStore.Set(idvar, &models.Client{
-		ID:     idvar,
-		Secret: secretvar,
-		Domain: domainvar,
-	})
+	for id, client := range clients {
+		clientStore.Set(id, client)
+	}
 	manager.MapClientStorage(clientStore)
-	srv := server.NewServer(server.NewConfig(), manager)
+	cfg := server.NewConfig()
+	srv := server.NewServer("Oauth2", cfg, manager)
 	srv.SetPasswordAuthorizationHandler(func(ctx context.Context, clientID, username, password string) (userID string, err error) {
 		if username == "test" && password == "test" {
 			userID = "test"
@@ -69,10 +65,30 @@ func main() {
 	srv.SetResponseErrorHandler(func(re *errors.Response) {
 		log.Println("Response Error:", re.Error.Error())
 	})
-	app := fiber.New()
-	app.Get("/login", loginHandler)
+
+	engine := html.New("./views", ".html")
+	engine.Reload(true)
+	app := fiber.New(fiber.Config{Views: engine})
+	app.Static("/", "./static")
+	app.Get("/login", func(ctx *fiber.Ctx) error {
+
+		return ctx.Render("login", fiber.Map{
+			"LogoURL": srv.Config.CompanyLogoFile,
+		})
+	})
 	app.Post("/login", loginPostHandler)
-	app.All("/auth", authHandler)
+	app.All("/auth", func(ctx *fiber.Ctx) error {
+		sessionStore, err := sess.Get(ctx)
+		if err != nil {
+			return err
+		}
+		if _, ok := sessionStore.Get("LoggedInUserID").(string); !ok {
+			return ctx.Redirect("/login", fiber.StatusFound)
+		}
+		return ctx.Render("auth", fiber.Map{
+			"LogoURL": srv.Config.CompanyLogoFile,
+		})
+	})
 	app.All("/oauth/authorize", func(ctx *fiber.Ctx) error {
 		sessionStore, err := sess.Get(ctx)
 		if err != nil {
@@ -100,11 +116,7 @@ func main() {
 		}
 		return ctx.JSON(data)
 	})
-
-	log.Printf("Server is running at %d port.\n", portvar)
-	log.Printf("Point your OAuth client Auth endpoint to %s:%d%s", "http://localhost", portvar, "/oauth/authorize")
-	log.Printf("Point your OAuth client Token endpoint to %s:%d%s", "http://localhost", portvar, "/oauth/token")
-	_ = app.Listen(fmt.Sprintf(":%d", portvar))
+	_ = app.Listen(fmt.Sprintf(":%d", port))
 }
 
 func userAuthorizeHandler(ctx *fiber.Ctx) (userID string, err error) {
@@ -129,10 +141,6 @@ func userAuthorizeHandler(ctx *fiber.Ctx) (userID string, err error) {
 	return
 }
 
-func loginHandler(ctx *fiber.Ctx) error {
-	return ctx.SendFile("static/login.html")
-}
-
 func loginPostHandler(ctx *fiber.Ctx) error {
 	sessionStore, err := sess.Get(ctx)
 	if err != nil {
@@ -145,16 +153,4 @@ func loginPostHandler(ctx *fiber.Ctx) error {
 	sessionStore.Set("LoggedInUserID", data.Username)
 	_ = sessionStore.Save()
 	return ctx.Redirect("/auth", fiber.StatusFound)
-}
-
-func authHandler(ctx *fiber.Ctx) error {
-	sessionStore, err := sess.Get(ctx)
-	if err != nil {
-		return err
-	}
-
-	if _, ok := sessionStore.Get("LoggedInUserID").(string); !ok {
-		return ctx.Redirect("/login", fiber.StatusFound)
-	}
-	return ctx.SendFile("static/auth.html")
 }

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Login</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+<div class="bg-white shadow-lg rounded-lg p-8 max-w-md w-full">
+    <!-- Logo Section -->
+    <div class="flex justify-center mb-6">
+        <img src="{{.LogoURL}}" alt="Logo" onerror="this.src='/default-logo.png';" class="h-16 rounded-md">
+    </div>
+    <h1 class="text-2xl font-semibold text-gray-800 text-center mb-3">Sign In</h1>
+    <form action="/login" method="POST" class="space-y-4">
+        <!-- Username -->
+        <div>
+            <label for="username" class="block text-sm font-medium text-gray-700">Username</label>
+            <input id="username" name="username" type="text" required
+                   placeholder="Enter your username"
+                   class="p-2 mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:ring-blue-500 focus:border-blue-500 text-sm">
+        </div>
+        <!-- Password -->
+        <div>
+            <label for="password" class="block text-sm font-medium text-gray-700">Password</label>
+            <input id="password" name="password" type="password" required
+                   placeholder="Enter your password"
+                   class="p-2 mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:ring-blue-500 focus:border-blue-500 text-sm">
+        </div>
+        <!-- Submit Button -->
+        <div>
+            <button type="submit"
+                    class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 text-sm font-medium">
+                Login
+            </button>
+        </div>
+    </form>
+</div>
+</body>
+
+</html>

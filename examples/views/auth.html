@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Authorize</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+<div class="bg-white shadow-lg rounded-lg p-8 max-w-md w-full">
+    <!-- Logo Section -->
+    <div class="flex justify-center mb-6">
+        <img src="{{.LogoURL}}" alt="Logo" onerror="this.src='/default-logo.png';" class="h-16 rounded-md">
+    </div>
+    <h1 class="text-2xl font-bold text-gray-800 text-center mb-4">Authorize</h1>
+    <p class="text-gray-600 text-center mb-6">
+        The client would like to perform actions on your behalf. Do you allow this?
+    </p>
+    <form action="/oauth/authorize" method="POST" class="flex flex-col items-center space-y-4">
+        <button
+                type="submit"
+                class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 text-sm font-medium"
+        >
+            Allow
+        </button>
+        <a href="/" class="text-blue-600 hover:underline text-sm">Cancel</a>
+    </form>
+</div>
+</body>
+
+</html>

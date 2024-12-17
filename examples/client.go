@@ -19,7 +19,7 @@ func main() {
 		ClientID:     "222222",
 		ClientSecret: "22222222",
 		Scopes:       []string{"all"},
-		RedirectURL:  "/oauth2",
+		RedirectURL:  "/callback",
 		Endpoint: oauth2.Endpoint{
 			AuthURL:  "/oauth/authorize",
 			TokenURL: "/oauth/token",
@@ -29,7 +29,7 @@ func main() {
 		authURL := oauth2Client.GenerateAuthURL("xyz", codeVerifier)
 		return c.Redirect(authURL)
 	})
-	app.Get("/oauth2", func(c *fiber.Ctx) error {
+	app.Get("/callback", func(c *fiber.Ctx) error {
 		state := c.Query("state")
 		if state != "xyz" {
 			return c.Status(fiber.StatusBadRequest).SendString("State invalid")
@@ -61,7 +61,7 @@ func main() {
 		if token == nil {
 			return c.Redirect("/")
 		}
-		response, err := oauth2Client.GET(context.Background(), token, "/test", map[string]string{})
+		response, err := oauth2Client.GET(context.Background(), "/test", map[string]string{})
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).SendString(err.Error())
 		}
