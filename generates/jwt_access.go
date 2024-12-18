@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
 	"github.com/oarkflow/oauth2"
@@ -17,13 +17,13 @@ import (
 
 // JWTAccessClaims jwt claims
 type JWTAccessClaims struct {
-	jwt.StandardClaims
+	jwt.RegisteredClaims
 	Scope string `json:"scope"`
 }
 
 // Valid claims verification
 func (a *JWTAccessClaims) Valid() error {
-	if time.Unix(a.ExpiresAt, 0).Before(time.Now()) {
+	if time.Unix(a.ExpiresAt.Unix(), 0).Before(time.Now()) {
 		return errors.ErrInvalidAccessToken
 	}
 	return nil
@@ -53,12 +53,12 @@ func (a *JWTAccessGenerate) Token(ctx context.Context, data *oauth2.GenerateBasi
 	IdString := Id.String()
 	IdString = strings.Replace(IdString, "-", "", -1)
 	claims := &JWTAccessClaims{
-		StandardClaims: jwt.StandardClaims{
-			Audience:  data.Client.GetID(),
+		RegisteredClaims: jwt.RegisteredClaims{
+			Audience:  []string{data.Client.GetID()},
 			Subject:   data.UserID,
-			ExpiresAt: data.TokenInfo.GetAccessCreateAt().Add(data.TokenInfo.GetAccessExpiresIn()).Unix(),
-			Id:        IdString,
-			IssuedAt:  time.Now().Unix(),
+			ExpiresAt: jwt.NewNumericDate(data.TokenInfo.GetAccessCreateAt().Add(data.TokenInfo.GetAccessExpiresIn())),
+			ID:        IdString,
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    a.Issuer,
 		},
 		Scope: data.TokenInfo.GetScope(),
