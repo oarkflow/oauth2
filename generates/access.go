@@ -22,18 +22,25 @@ type AccessGenerate struct {
 }
 
 // Token based on the UUID generated token
-func (ag *AccessGenerate) Token(ctx context.Context, data *oauth2.GenerateBasic, isGenRefresh bool) (string, string, error) {
+func (ag *AccessGenerate) Token(_ context.Context, data *oauth2.GenerateBasic, isGenRefresh bool) (string, string, error) {
 	buf := bytes.NewBufferString(data.Client.GetID())
 	buf.WriteString(data.UserID)
 	buf.WriteString(strconv.FormatInt(data.CreateAt.UnixNano(), 10))
 
-	access := base64.URLEncoding.EncodeToString([]byte(uuid.NewMD5(uuid.Must(uuid.NewRandom()), buf.Bytes()).String()))
-	access = strings.ToUpper(strings.TrimRight(access, "="))
+	access := generateBase64(buf.Bytes(), uuid.NewMD5)
 	refresh := ""
 	if isGenRefresh {
-		refresh = base64.URLEncoding.EncodeToString([]byte(uuid.NewSHA1(uuid.Must(uuid.NewRandom()), buf.Bytes()).String()))
-		refresh = strings.ToUpper(strings.TrimRight(refresh, "="))
+		refresh = generateBase64(buf.Bytes(), uuid.NewSHA1)
 	}
 
 	return access, refresh, nil
+}
+
+func generateBase64(buf []byte, hash func(uuid.UUID, []byte) uuid.UUID) string {
+	data := base64.URLEncoding.EncodeToString([]byte(hash(uuid.Must(uuid.NewRandom()), buf).String()))
+	return strings.ToUpper(strings.TrimRight(data, "="))
+}
+
+func init() {
+	uuid.EnableRandPool()
 }

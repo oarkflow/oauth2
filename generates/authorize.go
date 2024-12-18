@@ -3,8 +3,6 @@ package generates
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"strings"
 
 	"github.com/google/uuid"
 
@@ -23,9 +21,6 @@ type AuthorizeGenerate struct{}
 func (ag *AuthorizeGenerate) Token(_ context.Context, data *oauth2.GenerateBasic) (string, error) {
 	buf := bytes.NewBufferString(data.Client.GetID())
 	buf.WriteString(data.UserID)
-	token := uuid.NewMD5(uuid.Must(uuid.NewRandom()), buf.Bytes())
-	code := base64.URLEncoding.EncodeToString([]byte(token.String()))
-	code = strings.ToUpper(strings.TrimRight(code, "="))
-
+	code := generateBase64(buf.Bytes(), uuid.NewMD5)
 	return code, nil
 }
