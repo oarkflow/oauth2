@@ -29,7 +29,6 @@ import (
 type AuthRequest struct {
 	Method     string
 	Credential string
-	Provider   string
 	RemoteIP   string
 	UserAgent  string
 }
@@ -39,8 +38,69 @@ type AuthResult struct {
 	Token  string `json:"token"`
 }
 
-type AuthProvider interface {
-	Authenticate(ctx context.Context, req AuthRequest) (AuthResult, error)
+// --- Credential Store Interface ---
+
+type CredentialStore interface {
+	Authenticate(ctx context.Context, credential string) (userID string, err error)
+}
+
+// --- Password Credential Store ---
+
+type PasswordCredentialStore struct {
+	Users *UserStore
+}
+
+func (s *PasswordCredentialStore) Authenticate(ctx context.Context, credential string) (string, error) {
+	parts := strings.SplitN(credential, ":", 2)
+	if len(parts) != 2 {
+		return "", errors.New("invalid credential format")
+	}
+	id, hash, err := s.Users.FindByUsername(ctx, parts[0])
+	if err != nil {
+		return "", errors.New("user not found")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(parts[1])); err != nil {
+		return "", errors.New("unauthorized")
+	}
+	return id, nil
+}
+
+// --- API Key Credential Store ---
+
+type APIKeyCredentialStore struct {
+	APIKeys *APIKeyStore
+}
+
+func (s *APIKeyCredentialStore) Authenticate(ctx context.Context, credential string) (string, error) {
+	parts := strings.SplitN(credential, ":", 2)
+	if len(parts) != 2 {
+		return "", errors.New("invalid apikey format")
+	}
+	keyID, key := parts[0], parts[1]
+	userID, hash, err := s.APIKeys.FindByID(ctx, keyID)
+	if err != nil {
+		return "", errors.New("apikey not found")
+	}
+	keyHash := sha256.Sum256([]byte(key))
+	provided := base64.StdEncoding.EncodeToString(keyHash[:])
+	if subtle.ConstantTimeCompare([]byte(hash), []byte(provided)) != 1 {
+		return "", errors.New("unauthorized")
+	}
+	return userID, nil
+}
+
+// --- Credential Registry ---
+
+type CredentialRegistry struct {
+	Stores map[string]CredentialStore
+}
+
+func (r *CredentialRegistry) Get(method string) (CredentialStore, error) {
+	s, ok := r.Stores[method]
+	if !ok {
+		return nil, errors.New("unsupported method")
+	}
+	return s, nil
 }
 
 // --- Audit Logger ---
@@ -163,107 +223,37 @@ func generateAPIKey() (string, string, error) {
 	return key, base64.StdEncoding.EncodeToString(hash[:]), nil
 }
 
-// --- Internal Provider (Password, API Key) ---
+// --- Authenticator ---
 
-type InternalProvider struct {
-	Users   *UserStore
-	APIKeys *APIKeyStore
-	Signer  *JWTSigner
-	Auditor *AuditLogger
+type Authenticator struct {
+	Credentials *CredentialRegistry
+	Signer      *JWTSigner
+	Auditor     *AuditLogger
 }
 
-func (p *InternalProvider) Authenticate(ctx context.Context, req AuthRequest) (AuthResult, error) {
-	p.Auditor.LogEvent("auth_attempt",
+func (a *Authenticator) Authenticate(ctx context.Context, req AuthRequest) (AuthResult, error) {
+	a.Auditor.LogEvent("auth_attempt",
 		zap.String("method", req.Method),
 		zap.String("ip", req.RemoteIP),
 		zap.String("ua", req.UserAgent),
 	)
-	switch req.Method {
-	case "password":
-		parts := strings.SplitN(req.Credential, ":", 2)
-		if len(parts) != 2 {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "invalid_credential_format"))
-			return AuthResult{}, errors.New("invalid credential format")
-		}
-		id, hash, err := p.Users.FindByUsername(ctx, parts[0])
-		if err != nil {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "user_not_found"))
-			return AuthResult{}, errors.New("user not found")
-		}
-		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(parts[1])); err != nil {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "wrong_password"))
-			return AuthResult{}, errors.New("unauthorized")
-		}
-		token, err := p.Signer.Sign(id)
-		if err != nil {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "token_sign_error"))
-			return AuthResult{}, errors.New("token error")
-		}
-		p.Auditor.LogEvent("auth_success", zap.String("user", id))
-		return AuthResult{UserID: id, Token: token}, nil
-
-	case "apikey":
-		parts := strings.SplitN(req.Credential, ":", 2)
-		if len(parts) != 2 {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "invalid_apikey_format"))
-			return AuthResult{}, errors.New("invalid apikey format")
-		}
-		keyID, key := parts[0], parts[1]
-		userID, hash, err := p.APIKeys.FindByID(ctx, keyID)
-		if err != nil {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "apikey_not_found"))
-			return AuthResult{}, errors.New("apikey not found")
-		}
-		keyHash := sha256.Sum256([]byte(key))
-		provided := base64.StdEncoding.EncodeToString(keyHash[:])
-		if subtle.ConstantTimeCompare([]byte(hash), []byte(provided)) != 1 {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "apikey_wrong"))
-			return AuthResult{}, errors.New("unauthorized")
-		}
-		token, err := p.Signer.Sign(userID)
-		if err != nil {
-			p.Auditor.LogEvent("auth_failed", zap.String("reason", "token_sign_error"))
-			return AuthResult{}, errors.New("token error")
-		}
-		p.Auditor.LogEvent("auth_success", zap.String("user", userID))
-		return AuthResult{UserID: userID, Token: token}, nil
-
-	default:
-		p.Auditor.LogEvent("auth_failed", zap.String("reason", "unsupported_method"))
+	store, err := a.Credentials.Get(req.Method)
+	if err != nil {
+		a.Auditor.LogEvent("auth_failed", zap.String("reason", "unsupported_method"))
 		return AuthResult{}, errors.New("unsupported method")
 	}
-}
-
-// --- External Provider Example (Stub) ---
-
-type ExternalProvider struct {
-	Name    string
-	Auditor *AuditLogger
-	// Add config/clients as needed
-}
-
-func (e *ExternalProvider) Authenticate(ctx context.Context, req AuthRequest) (AuthResult, error) {
-	e.Auditor.LogEvent("auth_attempt_external",
-		zap.String("provider", e.Name),
-		zap.String("ip", req.RemoteIP),
-		zap.String("ua", req.UserAgent),
-	)
-	// Implement actual external provider logic here
-	return AuthResult{}, errors.New("external provider not implemented")
-}
-
-// --- Provider Registry ---
-
-type ProviderRegistry struct {
-	Providers map[string]AuthProvider
-}
-
-func (r *ProviderRegistry) Get(name string) (AuthProvider, error) {
-	prov, ok := r.Providers[name]
-	if !ok {
-		return nil, errors.New("provider not found")
+	userID, err := store.Authenticate(ctx, req.Credential)
+	if err != nil {
+		a.Auditor.LogEvent("auth_failed", zap.String("reason", err.Error()))
+		return AuthResult{}, err
 	}
-	return prov, nil
+	token, err := a.Signer.Sign(userID)
+	if err != nil {
+		a.Auditor.LogEvent("auth_failed", zap.String("reason", "token_sign_error"))
+		return AuthResult{}, errors.New("token error")
+	}
+	a.Auditor.LogEvent("auth_success", zap.String("user", userID))
+	return AuthResult{UserID: userID, Token: token}, nil
 }
 
 // --- Rate Limiter (per IP) ---
@@ -306,7 +296,7 @@ func (r *rateLimiter) Allow(ip string) bool {
 
 // --- HTTP Handler ---
 
-func AuthHandler(registry *ProviderRegistry, auditor *AuditLogger, limiter *rateLimiter) http.HandlerFunc {
+func AuthHandler(auth *Authenticator, auditor *AuditLogger, limiter *rateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Secure headers
 		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
@@ -337,20 +327,13 @@ func AuthHandler(registry *ProviderRegistry, auditor *AuditLogger, limiter *rate
 
 		method := r.Header.Get("X-Auth-Method")
 		cred := r.Header.Get("X-Auth-Credential")
-		providerName := r.Header.Get("X-Auth-Provider")
-		if providerName == "" {
-			providerName = "internal"
-		}
-		provider, err := registry.Get(providerName)
-		if err != nil {
-			auditor.LogEvent("auth_failed", zap.String("reason", "provider_not_found"), zap.String("ip", ip))
-			writeError(w, "provider not found", http.StatusBadRequest)
+		if method == "" || cred == "" {
+			writeError(w, "missing auth method or credential", http.StatusBadRequest)
 			return
 		}
-		res, err := provider.Authenticate(r.Context(), AuthRequest{
+		res, err := auth.Authenticate(r.Context(), AuthRequest{
 			Method:     method,
 			Credential: cred,
-			Provider:   providerName,
 			RemoteIP:   ip,
 			UserAgent:  r.UserAgent(),
 		})
@@ -392,7 +375,7 @@ func main() {
 	}
 
 	// Demo data
-	pass := "Secret1234!@"
+	pass := "Secret12345@"
 	if err := validatePasswordPolicy(pass); err != nil {
 		log.Fatalf("Demo password policy: %v", err)
 	}
@@ -404,20 +387,24 @@ func main() {
 
 	users := &UserStore{db}
 	apikeys := &APIKeyStore{db}
-	internal := &InternalProvider{Users: users, APIKeys: apikeys, Signer: signer, Auditor: auditor}
-	external := &ExternalProvider{Name: "external", Auditor: auditor}
 
-	registry := &ProviderRegistry{
-		Providers: map[string]AuthProvider{
-			"internal": internal,
-			"external": external,
-			// Add more providers here
+	credRegistry := &CredentialRegistry{
+		Stores: map[string]CredentialStore{
+			"password": &PasswordCredentialStore{Users: users},
+			"apikey":   &APIKeyCredentialStore{APIKeys: apikeys},
+			// Add more credential types here
 		},
+	}
+
+	auth := &Authenticator{
+		Credentials: credRegistry,
+		Signer:      signer,
+		Auditor:     auditor,
 	}
 
 	limiter := newRateLimiter(10, 1*time.Minute)
 
-	http.HandleFunc("/auth", AuthHandler(registry, auditor, limiter))
+	http.HandleFunc("/auth", AuthHandler(auth, auditor, limiter))
 	logger.Info("Starting server", zap.String("addr", ":8080"))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
@@ -439,3 +426,52 @@ func setupSchema(db *sql.DB) error {
 	`)
 	return err
 }
+
+/*
+// --- Example Usage ---
+//
+Example 1: Internal Provider (Password)
+  curl -X POST http://localhost:8080/auth \
+    -H "X-Auth-Method: password" \
+    -H "X-Auth-Credential: alice:Secret12345@" \
+    -H "X-Auth-Provider: internal"
+
+Example 2: Internal Provider (API Key)
+  curl -X POST http://localhost:8080/auth \
+    -H "X-Auth-Method: apikey" \
+    -H "X-Auth-Credential: k1:<API_KEY_FROM_CONSOLE>" \
+    -H "X-Auth-Provider: internal"
+
+Example 3: External Provider (Stub)
+  curl -X POST http://localhost:8080/auth \
+    -H "X-Auth-Method: any" \
+    -H "X-Auth-Credential: anything" \
+    -H "X-Auth-Provider: external"
+
+Replace <API_KEY_FROM_CONSOLE> with the API key printed on server startup.
+
+CREATE TABLE users (
+    id             UUID PRIMARY KEY,
+    username       TEXT UNIQUE NOT NULL,
+    email          TEXT UNIQUE NOT NULL,
+    phone          TEXT,
+    full_name      TEXT,
+    avatar_url     TEXT,
+    created_at     TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE TABLE credentials (
+    id              UUID PRIMARY KEY,
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type            TEXT NOT NULL, -- e.g., "password", "apikey", "oauth2", "cognito", "clerk"
+    provider        TEXT,          -- e.g., "internal", "google", "aws", "auth0"
+    identifier      TEXT,          -- Email, key ID, subject ID, etc.
+    secret_hash     TEXT,          -- bcrypt/sha256 (for passwords/apikeys), or NULL for OIDC
+    metadata        JSONB,         -- Store arbitrary metadata (token expiry, scopes, etc)
+    created_at      TIMESTAMP NOT NULL DEFAULT now(),
+    last_used_at    TIMESTAMP
+);
+
+
+*/
