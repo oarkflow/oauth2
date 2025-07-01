@@ -2,24 +2,32 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"log"
+	mathRand "math/rand"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
+	"github.com/coreos/go-oidc"
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/pquerna/otp/totp"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -44,49 +52,147 @@ type CredentialStore interface {
 	Authenticate(ctx context.Context, credential string) (userID string, err error)
 }
 
-// --- Password Credential Store ---
+// --- Credential Store Implementation (for all methods) ---
 
-type PasswordCredentialStore struct {
-	Users *UserStore
+type SQLCredentialStore struct {
+	DB *sql.DB
 }
 
-func (s *PasswordCredentialStore) Authenticate(ctx context.Context, credential string) (string, error) {
+func (s *SQLCredentialStore) Authenticate(ctx context.Context, credential string) (string, error) {
 	parts := strings.SplitN(credential, ":", 2)
 	if len(parts) != 2 {
 		return "", errors.New("invalid credential format")
 	}
-	id, hash, err := s.Users.FindByUsername(ctx, parts[0])
+	identifier, secret := parts[0], parts[1]
+
+	var (
+		userID     string
+		secretHash string
+		typ        string
+		provider   string
+		metadata   sql.NullString
+	)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT user_id, secret_hash, type, provider, metadata FROM credentials
+		WHERE identifier = ?
+	`, identifier)
+	err := row.Scan(&userID, &secretHash, &typ, &provider, &metadata)
 	if err != nil {
-		return "", errors.New("user not found")
+		return "", errors.New("credential not found")
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(parts[1])); err != nil {
-		return "", errors.New("unauthorized")
-	}
-	return id, nil
-}
 
-// --- API Key Credential Store ---
-
-type APIKeyCredentialStore struct {
-	APIKeys *APIKeyStore
-}
-
-func (s *APIKeyCredentialStore) Authenticate(ctx context.Context, credential string) (string, error) {
-	parts := strings.SplitN(credential, ":", 2)
-	if len(parts) != 2 {
-		return "", errors.New("invalid apikey format")
+	switch typ {
+	case "password":
+		if err := bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(secret)); err != nil {
+			return "", errors.New("unauthorized")
+		}
+		return userID, nil
+	case "apikey":
+		keyHash := sha256.Sum256([]byte(secret))
+		provided := base64.StdEncoding.EncodeToString(keyHash[:])
+		if subtle.ConstantTimeCompare([]byte(secretHash), []byte(provided)) != 1 {
+			return "", errors.New("unauthorized")
+		}
+		return userID, nil
+	case "cognito":
+		// metadata: {"region":"us-east-1","userPoolId":"...","clientId":"..."}
+		var meta struct {
+			Region     string `json:"region"`
+			UserPoolId string `json:"userPoolId"`
+			ClientId   string `json:"clientId"`
+		}
+		if err := json.Unmarshal([]byte(metadata.String), &meta); err != nil {
+			return "", errors.New("invalid cognito metadata")
+		}
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(meta.Region))
+		if err != nil {
+			return "", errors.New("aws config error")
+		}
+		cip := cognitoidentityprovider.NewFromConfig(cfg)
+		// secret = id_token or access_token
+		// Validate token using Cognito's JWKS
+		providerURL := fmt.Sprintf("https://cognito-idp.%s.amazonaws.com/%s", meta.Region, meta.UserPoolId)
+		verifier := oidc.NewVerifier(providerURL, oidc.NewRemoteKeySet(ctx, providerURL+"/.well-known/jwks.json"), &oidc.Config{ClientID: meta.ClientId})
+		idToken, err := verifier.Verify(ctx, secret)
+		if err != nil {
+			return "", errors.New("invalid cognito token")
+		}
+		claims := struct{ Sub string }{}
+		if err := idToken.Claims(&claims); err != nil {
+			return "", errors.New("invalid cognito claims")
+		}
+		// Use cip to fetch user info from Cognito (using access token)
+		getUserInput := &cognitoidentityprovider.GetUserInput{
+			AccessToken: &secret,
+		}
+		_, err = cip.GetUser(ctx, getUserInput)
+		if err != nil {
+			return "", errors.New("cognito user fetch failed")
+		}
+		// Optionally, check claims.Sub matches identifier
+		return userID, nil
+	case "oauth2", "google", "clerk":
+		// metadata: {"issuer":"...","clientId":"..."}
+		var meta struct {
+			Issuer   string `json:"issuer"`
+			ClientId string `json:"clientId"`
+		}
+		if err := json.Unmarshal([]byte(metadata.String), &meta); err != nil {
+			return "", errors.New("invalid oauth2 metadata")
+		}
+		provider, err := oidc.NewProvider(ctx, meta.Issuer)
+		if err != nil {
+			return "", errors.New("oidc provider error")
+		}
+		verifier := provider.Verifier(&oidc.Config{ClientID: meta.ClientId})
+		idToken, err := verifier.Verify(ctx, secret)
+		if err != nil {
+			return "", errors.New("invalid oauth2 token")
+		}
+		claims := struct{ Sub string }{}
+		if err := idToken.Claims(&claims); err != nil {
+			return "", errors.New("invalid oauth2 claims")
+		}
+		// Optionally, check claims.Sub matches identifier
+		return userID, nil
+	case "totp":
+		// metadata: {"secret":"BASE32SECRET"}
+		var meta struct {
+			Secret string `json:"secret"`
+		}
+		if err := json.Unmarshal([]byte(metadata.String), &meta); err != nil {
+			return "", errors.New("invalid totp metadata")
+		}
+		if !totp.Validate(secret, meta.Secret) {
+			return "", errors.New("invalid totp code")
+		}
+		return userID, nil
+	case "mfa", "2fa":
+		// metadata: {"type":"totp","secret":"..."} or {"type":"sms","code":"..."}
+		var meta map[string]interface{}
+		if err := json.Unmarshal([]byte(metadata.String), &meta); err != nil {
+			return "", errors.New("invalid mfa metadata")
+		}
+		switch meta["type"] {
+		case "totp":
+			if !totp.Validate(secret, meta["secret"].(string)) {
+				return "", errors.New("invalid mfa totp code")
+			}
+			return userID, nil
+		case "sms":
+			// For demo, compare code directly (in production, store hashed code)
+			if meta["code"] != secret {
+				return "", errors.New("invalid mfa sms code")
+			}
+			return userID, nil
+		default:
+			return "", errors.New("unsupported mfa type")
+		}
+	default:
+		return "", errors.New("unsupported credential type")
 	}
-	keyID, key := parts[0], parts[1]
-	userID, hash, err := s.APIKeys.FindByID(ctx, keyID)
-	if err != nil {
-		return "", errors.New("apikey not found")
-	}
-	keyHash := sha256.Sum256([]byte(key))
-	provided := base64.StdEncoding.EncodeToString(keyHash[:])
-	if subtle.ConstantTimeCompare([]byte(hash), []byte(provided)) != 1 {
-		return "", errors.New("unauthorized")
-	}
-	return userID, nil
 }
 
 // --- Credential Registry ---
@@ -165,27 +271,6 @@ func (j *JWTSigner) Sign(userID string) (string, error) {
 	return token.SignedString(j.PrivateKey)
 }
 
-// --- User and API Key Storage (SQLite-backed) ---
-
-type UserStore struct{ DB *sql.DB }
-type APIKeyStore struct{ DB *sql.DB }
-
-func (s *UserStore) FindByUsername(ctx context.Context, username string) (id, hash string, err error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	row := s.DB.QueryRowContext(ctx, "SELECT id, password_hash FROM users WHERE username = ?", username)
-	err = row.Scan(&id, &hash)
-	return
-}
-
-func (s *APIKeyStore) FindByID(ctx context.Context, keyID string) (userID, hash string, err error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	row := s.DB.QueryRowContext(ctx, "SELECT user_id, key_hash FROM api_keys WHERE id = ?", keyID)
-	err = row.Scan(&userID, &hash)
-	return
-}
-
 // --- Password Policy ---
 
 func validatePasswordPolicy(password string) error {
@@ -223,12 +308,104 @@ func generateAPIKey() (string, string, error) {
 	return key, base64.StdEncoding.EncodeToString(hash[:]), nil
 }
 
-// --- Authenticator ---
+// --- Session Management ---
+
+type Session struct {
+	ID        string
+	UserID    string
+	Token     string
+	ExpiresAt time.Time
+	Revoked   bool
+	CreatedAt time.Time
+}
+
+type SessionStore struct {
+	DB *sql.DB
+}
+
+func (s *SessionStore) Create(ctx context.Context, userID, userAgent, ip string, ttl time.Duration) (Session, error) {
+	id := generateRandomString(32)
+	token := generateSessionToken(id, userID)
+	expires := time.Now().Add(ttl)
+	_, err := s.DB.ExecContext(ctx, `
+		INSERT INTO sessions(id, user_id, token, user_agent, ip, expires_at, revoked, created_at)
+		VALUES(?,?,?,?,?,?,0,?)
+	`, id, userID, token, userAgent, ip, expires, time.Now())
+	if err != nil {
+		return Session{}, err
+	}
+	return Session{
+		ID:        id,
+		UserID:    userID,
+		Token:     token,
+		ExpiresAt: expires,
+		Revoked:   false,
+		CreatedAt: time.Now(),
+	}, nil
+}
+
+func (s *SessionStore) Validate(ctx context.Context, token string) (Session, error) {
+	var sess Session
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT id, user_id, token, expires_at, revoked, created_at
+		FROM sessions WHERE token = ?
+	`, token)
+	var revoked int
+	err := row.Scan(&sess.ID, &sess.UserID, &sess.Token, &sess.ExpiresAt, &revoked, &sess.CreatedAt)
+	if err != nil {
+		return Session{}, errors.New("invalid session")
+	}
+	if revoked != 0 || time.Now().After(sess.ExpiresAt) {
+		return Session{}, errors.New("session expired or revoked")
+	}
+	return sess, nil
+}
+
+func (s *SessionStore) Revoke(ctx context.Context, token string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE sessions SET revoked=1 WHERE token=?`, token)
+	return err
+}
+
+func (s *SessionStore) RevokeAllForUser(ctx context.Context, userID string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE sessions SET revoked=1 WHERE user_id=?`, userID)
+	return err
+}
+
+func generateSessionToken(sessionID, userID string) string {
+	// HMAC-based token, not guessable
+	secret := make([]byte, 32)
+	rand.Read(secret)
+	h := hmac.New(sha512.New, secret)
+	h.Write([]byte(sessionID + ":" + userID + ":" + fmt.Sprint(time.Now().UnixNano())))
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+}
+
+func generateRandomString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[mathRand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
+// --- Password Reset Token Management ---
+
+func generateResetToken() (string, string) {
+	raw := make([]byte, 32)
+	rand.Read(raw)
+	token := base64.RawURLEncoding.EncodeToString(raw)
+	hash := sha256.Sum256([]byte(token))
+	return token, base64.StdEncoding.EncodeToString(hash[:])
+}
+
+// --- Authenticator (add session support) ---
 
 type Authenticator struct {
 	Credentials *CredentialRegistry
 	Signer      *JWTSigner
 	Auditor     *AuditLogger
+	Sessions    *SessionStore
 }
 
 func (a *Authenticator) Authenticate(ctx context.Context, req AuthRequest) (AuthResult, error) {
@@ -252,8 +429,14 @@ func (a *Authenticator) Authenticate(ctx context.Context, req AuthRequest) (Auth
 		a.Auditor.LogEvent("auth_failed", zap.String("reason", "token_sign_error"))
 		return AuthResult{}, errors.New("token error")
 	}
+	// --- Create session ---
+	sess, err := a.Sessions.Create(ctx, userID, req.UserAgent, req.RemoteIP, 24*time.Hour)
+	if err != nil {
+		a.Auditor.LogEvent("session_create_failed", zap.String("user", userID))
+		return AuthResult{}, errors.New("session error")
+	}
 	a.Auditor.LogEvent("auth_success", zap.String("user", userID))
-	return AuthResult{UserID: userID, Token: token}, nil
+	return AuthResult{UserID: userID, Token: token + "|" + sess.Token}, nil
 }
 
 // --- Rate Limiter (per IP) ---
@@ -353,7 +536,392 @@ func writeError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// --- Setup: DB, Logger, Providers, Server ---
+// --- HTTP Handlers for Session and Password Management ---
+
+func extractSessionToken(r *http.Request) string {
+	// Try Authorization: Bearer <token> or Cookie: session_token
+	authz := r.Header.Get("Authorization")
+	if strings.HasPrefix(authz, "Bearer ") {
+		parts := strings.SplitN(authz, " ", 2)
+		if len(parts) == 2 {
+			return parts[1]
+		}
+	}
+	cookie, err := r.Cookie("session_token")
+	if err == nil {
+		return cookie.Value
+	}
+	return ""
+}
+
+func LogoutHandler(auth *Authenticator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := extractSessionToken(r)
+		if token == "" {
+			writeError(w, "missing session token", http.StatusUnauthorized)
+			return
+		}
+		if err := auth.Sessions.Revoke(r.Context(), token); err != nil {
+			writeError(w, "logout failed", http.StatusInternalServerError)
+			return
+		}
+		// Clear session cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:     "session_token",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// --- Frontend HTTP Handlers for Password Management ---
+
+func FrontendForgotPasswordHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data := map[string]interface{}{}
+		if r.Method == http.MethodPost {
+			email := r.FormValue("email")
+			if email == "" {
+				data["Error"] = "Email required"
+				forgotTmpl.Execute(w, data)
+				return
+			}
+			var userID string
+			row := db.QueryRow(`SELECT id FROM users WHERE email=?`, email)
+			if err := row.Scan(&userID); err != nil {
+				data["Error"] = "User not found"
+				forgotTmpl.Execute(w, data)
+				return
+			}
+			token, hash := generateResetToken()
+			_, err := db.Exec(`INSERT INTO password_resets(user_id, token_hash, expires_at, used) VALUES(?,?,?,0)`,
+				userID, hash, time.Now().Add(30*time.Minute))
+			if err != nil {
+				data["Error"] = "Could not create reset token"
+				forgotTmpl.Execute(w, data)
+				return
+			}
+			// In production, send token via email. Here, just show it.
+			data["ResetToken"] = token
+		}
+		forgotTmpl.Execute(w, data)
+	}
+}
+
+func FrontendResetPasswordHandler(db *sql.DB, auth *Authenticator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data := map[string]interface{}{}
+		if r.Method == http.MethodPost {
+			token := r.FormValue("token")
+			password := r.FormValue("password")
+			if token == "" || password == "" {
+				data["Error"] = "Token and new password required"
+				resetTmpl.Execute(w, data)
+				return
+			}
+			if err := validatePasswordPolicy(password); err != nil {
+				data["Error"] = err.Error()
+				resetTmpl.Execute(w, data)
+				return
+			}
+			hash := sha256.Sum256([]byte(token))
+			var userID string
+			var expires time.Time
+			var used int
+			row := db.QueryRow(`SELECT user_id, expires_at, used FROM password_resets WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
+			if err := row.Scan(&userID, &expires, &used); err != nil || used != 0 || time.Now().After(expires) {
+				data["Error"] = "Invalid or expired token"
+				resetTmpl.Execute(w, data)
+				return
+			}
+			passHash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			_, err := db.Exec(`UPDATE credentials SET secret_hash=? WHERE user_id=? AND type='password'`, string(passHash), userID)
+			if err != nil {
+				data["Error"] = "Could not update password"
+				resetTmpl.Execute(w, data)
+				return
+			}
+			_, _ = db.Exec(`UPDATE password_resets SET used=1 WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
+			_ = auth.Sessions.RevokeAllForUser(r.Context(), userID)
+			data["Success"] = true
+		}
+		resetTmpl.Execute(w, data)
+	}
+}
+
+func FrontendChangePasswordHandler(db *sql.DB, auth *Authenticator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data := map[string]interface{}{}
+		var sessionToken string
+		// Try to get session token from cookie
+		if cookie, err := r.Cookie("session_token"); err == nil {
+			sessionToken = cookie.Value
+		}
+		if r.Method == http.MethodPost {
+			if sessionToken == "" {
+				sessionToken = r.FormValue("session_token")
+			}
+			oldPassword := r.FormValue("old_password")
+			newPassword := r.FormValue("new_password")
+			if sessionToken == "" || oldPassword == "" || newPassword == "" {
+				data["Error"] = "All fields required"
+				changeTmpl.Execute(w, data)
+				return
+			}
+			if err := validatePasswordPolicy(newPassword); err != nil {
+				data["Error"] = err.Error()
+				changeTmpl.Execute(w, data)
+				return
+			}
+			sess, err := auth.Sessions.Validate(r.Context(), sessionToken)
+			if err != nil {
+				data["Error"] = "Invalid session"
+				changeTmpl.Execute(w, data)
+				return
+			}
+			var secretHash string
+			row := db.QueryRow(`SELECT secret_hash FROM credentials WHERE user_id=? AND type='password'`, sess.UserID)
+			if err := row.Scan(&secretHash); err != nil {
+				data["Error"] = "User not found"
+				changeTmpl.Execute(w, data)
+				return
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(oldPassword)); err != nil {
+				data["Error"] = "Old password incorrect"
+				changeTmpl.Execute(w, data)
+				return
+			}
+			passHash, _ := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+			_, err = db.Exec(`UPDATE credentials SET secret_hash=? WHERE user_id=? AND type='password'`, string(passHash), sess.UserID)
+			if err != nil {
+				data["Error"] = "Could not update password"
+				changeTmpl.Execute(w, data)
+				return
+			}
+			_ = auth.Sessions.RevokeAllForUser(r.Context(), sess.UserID)
+			// Clear session cookie
+			http.SetCookie(w, &http.Cookie{
+				Name:     "session_token",
+				Value:    "",
+				Path:     "/",
+				MaxAge:   -1,
+				HttpOnly: true,
+				Secure:   true,
+				SameSite: http.SameSiteStrictMode,
+			})
+			data["Success"] = true
+		}
+		changeTmpl.Execute(w, data)
+	}
+}
+
+// --- Update FrontendHandler to set session cookie on login and clear on logout ---
+
+func FrontendHandler(auth *Authenticator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data := map[string]interface{}{}
+		if r.Method == http.MethodPost {
+			method := r.FormValue("method")
+			var credential string
+			switch method {
+			case "password":
+				credential = r.FormValue("username") + ":" + r.FormValue("password")
+			case "apikey":
+				credential = "k1:" + r.FormValue("apikey")
+			case "cognito", "oauth2", "google", "clerk":
+				credential = r.FormValue("username") + ":" + r.FormValue("token")
+			case "totp":
+				credential = r.FormValue("username") + ":" + r.FormValue("totp")
+			case "mfa", "2fa":
+				credential = r.FormValue("username") + ":" + r.FormValue("mfa")
+			default:
+				data["Error"] = "Unsupported method"
+				loginTmpl.Execute(w, data)
+				return
+			}
+			res, err := auth.Authenticate(r.Context(), AuthRequest{
+				Method:     method,
+				Credential: credential,
+				RemoteIP:   r.RemoteAddr,
+				UserAgent:  r.UserAgent(),
+			})
+			if err != nil {
+				data["Error"] = err.Error()
+			} else {
+				data["Token"] = res.Token
+				// Split by '|'
+				toks := strings.SplitN(res.Token, "|", 2)
+				if len(toks) == 2 {
+					data["SessionToken"] = toks[1]
+					// Set session cookie
+					http.SetCookie(w, &http.Cookie{
+						Name:     "session_token",
+						Value:    toks[1],
+						Path:     "/",
+						HttpOnly: true,
+						Secure:   true,
+						SameSite: http.SameSiteStrictMode,
+						MaxAge:   86400,
+					})
+				}
+			}
+		}
+		loginTmpl.Execute(w, data)
+	}
+}
+
+var loginTmpl = template.Must(template.New("login").Parse(`
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Login</title>
+	<style>
+		body { font-family: sans-serif; background: #f7f7f7; }
+		.form-box { background: #fff; padding: 2em; margin: 2em auto; max-width: 400px; border-radius: 8px; box-shadow: 0 2px 8px #ccc; }
+		.error { color: #b00; }
+		.token { word-break: break-all; background: #eee; padding: 0.5em; }
+	</style>
+	<script>
+	function onProviderChange() {
+		var method = document.getElementById('method').value;
+		document.getElementById('username-row').style.display = (method === 'password') ? '' : 'none';
+		document.getElementById('password-row').style.display = (method === 'password') ? '' : 'none';
+		document.getElementById('apikey-row').style.display = (method === 'apikey') ? '' : 'none';
+		document.getElementById('token-row').style.display = (['oauth2','google','clerk','cognito'].includes(method)) ? '' : 'none';
+		document.getElementById('totp-row').style.display = (method === 'totp') ? '' : 'none';
+		document.getElementById('mfa-row').style.display = (['mfa','2fa'].includes(method)) ? '' : 'none';
+	}
+	</script>
+</head>
+<body>
+	<div class="form-box">
+		<h2>Login</h2>
+		{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+		{{if .Token}}
+			<div>Login successful! JWT:</div>
+			<div class="token">{{.Token}}</div>
+			<br>
+			<form method="POST" action="/logout">
+				<input type="hidden" name="session_token" value="{{.SessionToken}}">
+				<button type="submit">Logout</button>
+			</form>
+			<br>
+			<a href="/change-password">Change Password</a>
+		{{else}}
+		<form method="POST" autocomplete="off">
+			<label for="method">Provider:</label>
+			<select name="method" id="method" onchange="onProviderChange()">
+				<option value="password">Password</option>
+				<option value="apikey">API Key</option>
+				<option value="cognito">AWS Cognito</option>
+				<option value="oauth2">OAuth2 (Generic)</option>
+				<option value="google">Google OAuth2</option>
+				<option value="clerk">Clerk</option>
+				<option value="totp">TOTP</option>
+				<option value="mfa">MultiDevice MFA</option>
+				<option value="2fa">2FA</option>
+			</select>
+			<div id="username-row">
+				<label>Username: <input type="text" name="username" autocomplete="username"></label>
+			</div>
+			<div id="password-row">
+				<label>Password: <input type="password" name="password" autocomplete="current-password"></label>
+			</div>
+			<div id="apikey-row" style="display:none">
+				<label>API Key: <input type="text" name="apikey"></label>
+			</div>
+			<div id="token-row" style="display:none">
+				<label>Token: <input type="text" name="token"></label>
+			</div>
+			<div id="totp-row" style="display:none">
+				<label>TOTP Code: <input type="text" name="totp"></label>
+			</div>
+			<div id="mfa-row" style="display:none">
+				<label>MFA/2FA Code: <input type="text" name="mfa"></label>
+			</div>
+			<br>
+			<button type="submit">Login</button>
+		</form>
+		<a href="/forgot-password">Forgot Password?</a>
+		<script>onProviderChange();</script>
+		{{end}}
+	</div>
+</body>
+</html>
+`))
+
+// Add templates for forgot/reset/change password
+var forgotTmpl = template.Must(template.New("forgot").Parse(`
+<!DOCTYPE html>
+<html>
+<head><title>Forgot Password</title></head>
+<body>
+	<div class="form-box">
+		<h2>Forgot Password</h2>
+		{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+		{{if .ResetToken}}
+			<div>Reset token (for demo): <span class="token">{{.ResetToken}}</span></div>
+			<a href="/reset-password">Reset Password</a>
+		{{else}}
+		<form method="POST">
+			<label>Email: <input type="email" name="email"></label>
+			<button type="submit">Send Reset Link</button>
+		</form>
+		{{end}}
+	</div>
+</body>
+</html>
+`))
+
+var resetTmpl = template.Must(template.New("reset").Parse(`
+<!DOCTYPE html>
+<html>
+<head><title>Reset Password</title></head>
+<body>
+	<div class="form-box">
+		<h2>Reset Password</h2>
+		{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+		{{if .Success}}
+			<div>Password reset successful. <a href="/login">Login</a></div>
+		{{else}}
+		<form method="POST">
+			<label>Reset Token: <input type="text" name="token"></label><br>
+			<label>New Password: <input type="password" name="password"></label><br>
+			<button type="submit">Reset Password</button>
+		</form>
+		{{end}}
+	</div>
+</body>
+</html>
+`))
+
+var changeTmpl = template.Must(template.New("change").Parse(`
+<!DOCTYPE html>
+<html>
+<head><title>Change Password</title></head>
+<body>
+	<div class="form-box">
+		<h2>Change Password</h2>
+		{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+		{{if .Success}}
+			<div>Password changed. Please <a href="/login">login</a> again.</div>
+		{{else}}
+		<form method="POST">
+			<label>Session Token: <input type="text" name="session_token"></label><br>
+			<label>Old Password: <input type="password" name="old_password"></label><br>
+			<label>New Password: <input type="password" name="new_password"></label><br>
+			<button type="submit">Change Password</button>
+		</form>
+		{{end}}
+	</div>
+</body>
+</html>
+`))
 
 func main() {
 	logger, _ := zap.NewProduction()
@@ -380,98 +948,58 @@ func main() {
 		log.Fatalf("Demo password policy: %v", err)
 	}
 	passHash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
-	db.Exec("INSERT INTO users(id, username, password_hash) VALUES(?,?,?)", "u1", "alice", string(passHash))
+	_, err = db.Exec(`INSERT INTO users(id, username, email, created_at, updated_at) VALUES(?,?,?,?,?)`,
+		"u1", "alice", "alice@example.com", time.Now(), time.Now())
+	if err != nil {
+		log.Fatalf("Demo user insert error: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+		VALUES(?,?,?,?,?,?,?)`,
+		"c1", "u1", "password", "internal", "alice", string(passHash), time.Now())
+	if err != nil {
+		log.Fatalf("Demo password credential insert error: %v", err)
+	}
 	key, keyHash, _ := generateAPIKey()
-	db.Exec("INSERT INTO api_keys(id, user_id, key_hash) VALUES(?,?,?)", "k1", "u1", keyHash)
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+		VALUES(?,?,?,?,?,?,?)`,
+		"k1", "u1", "apikey", "internal", "k1", keyHash, time.Now())
+	if err != nil {
+		log.Fatalf("Demo apikey credential insert error: %v", err)
+	}
 	fmt.Println("Api Key", key)
 
-	users := &UserStore{db}
-	apikeys := &APIKeyStore{db}
-
+	credStore := &SQLCredentialStore{DB: db}
 	credRegistry := &CredentialRegistry{
 		Stores: map[string]CredentialStore{
-			"password": &PasswordCredentialStore{Users: users},
-			"apikey":   &APIKeyCredentialStore{APIKeys: apikeys},
-			// Add more credential types here
+			"password": credStore,
+			"apikey":   credStore,
+			"cognito":  credStore,
+			"oauth2":   credStore,
+			"google":   credStore,
+			"clerk":    credStore,
+			"totp":     credStore,
+			"mfa":      credStore,
+			"2fa":      credStore,
 		},
 	}
+
+	sessionStore := &SessionStore{DB: db}
 
 	auth := &Authenticator{
 		Credentials: credRegistry,
 		Signer:      signer,
 		Auditor:     auditor,
+		Sessions:    sessionStore,
 	}
 
 	limiter := newRateLimiter(10, 1*time.Minute)
 
 	http.HandleFunc("/auth", AuthHandler(auth, auditor, limiter))
+	http.HandleFunc("/login", FrontendHandler(auth))
+	http.HandleFunc("/logout", LogoutHandler(auth))
+	http.HandleFunc("/forgot-password", FrontendForgotPasswordHandler(db))
+	http.HandleFunc("/reset-password", FrontendResetPasswordHandler(db, auth))
+	http.HandleFunc("/change-password", FrontendChangePasswordHandler(db, auth))
 	logger.Info("Starting server", zap.String("addr", ":8080"))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
-
-// --- DB Schema Helper ---
-
-func setupSchema(db *sql.DB) error {
-	_, err := db.Exec(`
-	CREATE TABLE IF NOT EXISTS users (
-		id TEXT PRIMARY KEY,
-		username TEXT UNIQUE NOT NULL,
-		password_hash TEXT NOT NULL
-	);
-	CREATE TABLE IF NOT EXISTS api_keys (
-		id TEXT PRIMARY KEY,
-		user_id TEXT NOT NULL,
-		key_hash TEXT NOT NULL
-	);
-	`)
-	return err
-}
-
-/*
-// --- Example Usage ---
-//
-Example 1: Internal Provider (Password)
-  curl -X POST http://localhost:8080/auth \
-    -H "X-Auth-Method: password" \
-    -H "X-Auth-Credential: alice:Secret12345@" \
-    -H "X-Auth-Provider: internal"
-
-Example 2: Internal Provider (API Key)
-  curl -X POST http://localhost:8080/auth \
-    -H "X-Auth-Method: apikey" \
-    -H "X-Auth-Credential: k1:<API_KEY_FROM_CONSOLE>" \
-    -H "X-Auth-Provider: internal"
-
-Example 3: External Provider (Stub)
-  curl -X POST http://localhost:8080/auth \
-    -H "X-Auth-Method: any" \
-    -H "X-Auth-Credential: anything" \
-    -H "X-Auth-Provider: external"
-
-Replace <API_KEY_FROM_CONSOLE> with the API key printed on server startup.
-
-CREATE TABLE users (
-    id             UUID PRIMARY KEY,
-    username       TEXT UNIQUE NOT NULL,
-    email          TEXT UNIQUE NOT NULL,
-    phone          TEXT,
-    full_name      TEXT,
-    avatar_url     TEXT,
-    created_at     TIMESTAMP NOT NULL DEFAULT now(),
-    updated_at     TIMESTAMP NOT NULL DEFAULT now()
-);
-
-CREATE TABLE credentials (
-    id              UUID PRIMARY KEY,
-    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    type            TEXT NOT NULL, -- e.g., "password", "apikey", "oauth2", "cognito", "clerk"
-    provider        TEXT,          -- e.g., "internal", "google", "aws", "auth0"
-    identifier      TEXT,          -- Email, key ID, subject ID, etc.
-    secret_hash     TEXT,          -- bcrypt/sha256 (for passwords/apikeys), or NULL for OIDC
-    metadata        JSONB,         -- Store arbitrary metadata (token expiry, scopes, etc)
-    created_at      TIMESTAMP NOT NULL DEFAULT now(),
-    last_used_at    TIMESTAMP
-);
-
-
-*/

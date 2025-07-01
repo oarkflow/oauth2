@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/session"
@@ -37,8 +40,19 @@ func main() {
 	manager.SetAuthorizeCodeTokenCfg(manage.DefaultAuthorizeCodeTokenCfg)
 	manager.MustTokenStorage(store.NewMemoryTokenStore())
 	manager.MapAccessGenerate(generates.NewAccessGenerate())
-
-	clientStore := store.NewClientStore()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		log.Fatalf("DB open error: %v", err)
+	} else {
+		log.Println("DB opened successfully")
+	}
+	err = store.SetupClientsTable(db)
+	if err != nil {
+		log.Fatalf("DB setup error: %v", err)
+	} else {
+		log.Println("DB setup successfully")
+	}
+	clientStore := store.NewSQLClientStore(db)
 	for id, client := range clients {
 		clientStore.Set(id, client)
 	}

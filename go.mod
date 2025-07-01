@@ -6,6 +6,7 @@ require (
 	github.com/gofiber/fiber/v2 v2.52.8
 	github.com/gofiber/template/html/v2 v2.1.3
 	github.com/google/uuid v1.6.0
+	github.com/mattn/go-sqlite3 v1.14.28
 	github.com/tidwall/buntdb v1.3.2
 	golang.org/x/oauth2 v0.30.0
 )
