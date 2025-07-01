@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
-	"github.com/oarkflow/oauth2/examples/providers/custom"
 	"log"
 
+	"github.com/oarkflow/oauth2/examples/providers/custom"
+
 	"github.com/gofiber/fiber/v2"
+
 	"github.com/oarkflow/oauth2/client"
 )
 
