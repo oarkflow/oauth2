@@ -374,7 +374,7 @@ func (s *SessionStore) RevokeAllForUser(ctx context.Context, userID string) erro
 func generateSessionToken(sessionID, userID string) string {
 	// HMAC-based token, not guessable
 	secret := make([]byte, 32)
-	rand.Read(secret)
+	_, _ = rand.Read(secret)
 	h := hmac.New(sha512.New, secret)
 	h.Write([]byte(sessionID + ":" + userID + ":" + fmt.Sprint(time.Now().UnixNano())))
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
@@ -393,7 +393,7 @@ func generateRandomString(n int) string {
 
 func generateResetToken() (string, string) {
 	raw := make([]byte, 32)
-	rand.Read(raw)
+	_, _ = rand.Read(raw)
 	token := base64.RawURLEncoding.EncodeToString(raw)
 	hash := sha256.Sum256([]byte(token))
 	return token, base64.StdEncoding.EncodeToString(hash[:])
@@ -526,14 +526,14 @@ func AuthHandler(auth *Authenticator, auditor *AuditLogger, limiter *rateLimiter
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(res)
+		_ = json.NewEncoder(w).Encode(res)
 	}
 }
 
 func writeError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // --- HTTP Handlers for Session and Password Management ---
@@ -588,14 +588,14 @@ func FrontendForgotPasswordHandler(db *sql.DB) http.HandlerFunc {
 			email := r.FormValue("email")
 			if email == "" {
 				data["Error"] = "Email required"
-				forgotTmpl.Execute(w, data)
+				_ = forgotTmpl.Execute(w, data)
 				return
 			}
 			var userID string
 			row := db.QueryRow(`SELECT id FROM users WHERE email=?`, email)
 			if err := row.Scan(&userID); err != nil {
 				data["Error"] = "User not found"
-				forgotTmpl.Execute(w, data)
+				_ = forgotTmpl.Execute(w, data)
 				return
 			}
 			token, hash := generateResetToken()
@@ -603,13 +603,13 @@ func FrontendForgotPasswordHandler(db *sql.DB) http.HandlerFunc {
 				userID, hash, time.Now().Add(30*time.Minute))
 			if err != nil {
 				data["Error"] = "Could not create reset token"
-				forgotTmpl.Execute(w, data)
+				_ = forgotTmpl.Execute(w, data)
 				return
 			}
 			// In production, send token via email. Here, just show it.
 			data["ResetToken"] = token
 		}
-		forgotTmpl.Execute(w, data)
+		_ = forgotTmpl.Execute(w, data)
 	}
 }
 
@@ -621,12 +621,12 @@ func FrontendResetPasswordHandler(db *sql.DB, auth *Authenticator) http.HandlerF
 			password := r.FormValue("password")
 			if token == "" || password == "" {
 				data["Error"] = "Token and new password required"
-				resetTmpl.Execute(w, data)
+				_ = resetTmpl.Execute(w, data)
 				return
 			}
 			if err := validatePasswordPolicy(password); err != nil {
 				data["Error"] = err.Error()
-				resetTmpl.Execute(w, data)
+				_ = resetTmpl.Execute(w, data)
 				return
 			}
 			hash := sha256.Sum256([]byte(token))
@@ -636,21 +636,21 @@ func FrontendResetPasswordHandler(db *sql.DB, auth *Authenticator) http.HandlerF
 			row := db.QueryRow(`SELECT user_id, expires_at, used FROM password_resets WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
 			if err := row.Scan(&userID, &expires, &used); err != nil || used != 0 || time.Now().After(expires) {
 				data["Error"] = "Invalid or expired token"
-				resetTmpl.Execute(w, data)
+				_ = resetTmpl.Execute(w, data)
 				return
 			}
 			passHash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 			_, err := db.Exec(`UPDATE credentials SET secret_hash=? WHERE user_id=? AND type='password'`, string(passHash), userID)
 			if err != nil {
 				data["Error"] = "Could not update password"
-				resetTmpl.Execute(w, data)
+				_ = resetTmpl.Execute(w, data)
 				return
 			}
 			_, _ = db.Exec(`UPDATE password_resets SET used=1 WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
 			_ = auth.Sessions.RevokeAllForUser(r.Context(), userID)
 			data["Success"] = true
 		}
-		resetTmpl.Execute(w, data)
+		_ = resetTmpl.Execute(w, data)
 	}
 }
 
@@ -670,37 +670,37 @@ func FrontendChangePasswordHandler(db *sql.DB, auth *Authenticator) http.Handler
 			newPassword := r.FormValue("new_password")
 			if sessionToken == "" || oldPassword == "" || newPassword == "" {
 				data["Error"] = "All fields required"
-				changeTmpl.Execute(w, data)
+				_ = changeTmpl.Execute(w, data)
 				return
 			}
 			if err := validatePasswordPolicy(newPassword); err != nil {
 				data["Error"] = err.Error()
-				changeTmpl.Execute(w, data)
+				_ = changeTmpl.Execute(w, data)
 				return
 			}
 			sess, err := auth.Sessions.Validate(r.Context(), sessionToken)
 			if err != nil {
 				data["Error"] = "Invalid session"
-				changeTmpl.Execute(w, data)
+				_ = changeTmpl.Execute(w, data)
 				return
 			}
 			var secretHash string
 			row := db.QueryRow(`SELECT secret_hash FROM credentials WHERE user_id=? AND type='password'`, sess.UserID)
 			if err := row.Scan(&secretHash); err != nil {
 				data["Error"] = "User not found"
-				changeTmpl.Execute(w, data)
+				_ = changeTmpl.Execute(w, data)
 				return
 			}
 			if err := bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(oldPassword)); err != nil {
 				data["Error"] = "Old password incorrect"
-				changeTmpl.Execute(w, data)
+				_ = changeTmpl.Execute(w, data)
 				return
 			}
 			passHash, _ := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
 			_, err = db.Exec(`UPDATE credentials SET secret_hash=? WHERE user_id=? AND type='password'`, string(passHash), sess.UserID)
 			if err != nil {
 				data["Error"] = "Could not update password"
-				changeTmpl.Execute(w, data)
+				_ = changeTmpl.Execute(w, data)
 				return
 			}
 			_ = auth.Sessions.RevokeAllForUser(r.Context(), sess.UserID)
@@ -716,7 +716,7 @@ func FrontendChangePasswordHandler(db *sql.DB, auth *Authenticator) http.Handler
 			})
 			data["Success"] = true
 		}
-		changeTmpl.Execute(w, data)
+		_ = changeTmpl.Execute(w, data)
 	}
 }
 
@@ -741,7 +741,7 @@ func FrontendHandler(auth *Authenticator) http.HandlerFunc {
 				credential = r.FormValue("username") + ":" + r.FormValue("mfa")
 			default:
 				data["Error"] = "Unsupported method"
-				loginTmpl.Execute(w, data)
+				_ = loginTmpl.Execute(w, data)
 				return
 			}
 			res, err := auth.Authenticate(r.Context(), AuthRequest{
@@ -771,7 +771,7 @@ func FrontendHandler(auth *Authenticator) http.HandlerFunc {
 				}
 			}
 		}
-		loginTmpl.Execute(w, data)
+		_ = loginTmpl.Execute(w, data)
 	}
 }
 
@@ -925,7 +925,9 @@ var changeTmpl = template.Must(template.New("change").Parse(`
 
 func main() {
 	logger, _ := zap.NewProduction()
-	defer logger.Sync()
+	defer func() {
+		_ = logger.Sync()
+	}()
 	auditor := &AuditLogger{logger}
 
 	signer, err := NewJWTSigner()
@@ -933,11 +935,13 @@ func main() {
 		log.Fatalf("JWT signer error: %v", err)
 	}
 
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open("sqlite3", "store.db")
 	if err != nil {
 		log.Fatalf("DB open error: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 	if err := setupSchema(db); err != nil {
 		log.Fatalf("DB schema error: %v", err)
 	}
