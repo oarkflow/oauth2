@@ -8,14 +8,15 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
+	"crypto/x509"
 	"database/sql"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"log"
-	mathRand "math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -36,7 +37,8 @@ import (
 
 type AuthRequest struct {
 	Method     string
-	Credential string
+	Identifier string
+	Secret     string
 	RemoteIP   string
 	UserAgent  string
 }
@@ -49,7 +51,7 @@ type AuthResult struct {
 // --- Credential Store Interface ---
 
 type CredentialStore interface {
-	Authenticate(ctx context.Context, credential string) (userID string, err error)
+	Authenticate(ctx context.Context, identifier, secret string) (userID string, err error)
 }
 
 // --- Credential Store Implementation (for all methods) ---
@@ -58,13 +60,7 @@ type SQLCredentialStore struct {
 	DB *sql.DB
 }
 
-func (s *SQLCredentialStore) Authenticate(ctx context.Context, credential string) (string, error) {
-	parts := strings.SplitN(credential, ":", 2)
-	if len(parts) != 2 {
-		return "", errors.New("invalid credential format")
-	}
-	identifier, secret := parts[0], parts[1]
-
+func (s *SQLCredentialStore) Authenticate(ctx context.Context, identifier, secret string) (string, error) {
 	var (
 		userID     string
 		secretHash string
@@ -83,10 +79,32 @@ func (s *SQLCredentialStore) Authenticate(ctx context.Context, credential string
 		return "", errors.New("credential not found")
 	}
 
+	// Account lockout check
+	if typ == "password" {
+		failed, err := getFailedLogin(s.DB, identifier)
+		if err == nil && failed.Count >= maxFailedAttempts && time.Since(failed.LockedAt) < lockoutDuration {
+			return "", errors.New("account locked due to too many failed attempts")
+		}
+	}
+
 	switch typ {
 	case "password":
 		if err := bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(secret)); err != nil {
+			_ = recordFailedLogin(s.DB, identifier)
+			// Exponential backoff
+			failed, _ := getFailedLogin(s.DB, identifier)
+			delay := backoffBase * time.Duration(1<<failed.Count)
+			if delay > backoffMax {
+				delay = backoffMax
+			}
+			time.Sleep(delay)
 			return "", errors.New("unauthorized")
+		}
+		_ = resetFailedLogin(s.DB, identifier)
+		// Password rotation enforcement
+		rotate, _ := checkPasswordRotation(s.DB, identifier)
+		if rotate {
+			return "", errors.New("password rotation required")
 		}
 		return userID, nil
 	case "apikey":
@@ -237,13 +255,9 @@ func NewJWTSigner() (*JWTSigner, error) {
 }
 
 func generateKeyID(key *rsa.PrivateKey) string {
-	pubASN1 := sha256.Sum256(x509MarshalPKCS1PublicKey(&key.PublicKey))
-	return base64.RawURLEncoding.EncodeToString(pubASN1[:8])
-}
-
-func x509MarshalPKCS1PublicKey(pub *rsa.PublicKey) []byte {
-	// Minimal ASN.1 encoding for key fingerprinting
-	return []byte(fmt.Sprintf("%d%d", pub.N.BitLen(), pub.E))
+	pubASN1 := x509.MarshalPKCS1PublicKey(&key.PublicKey)
+	hash := sha256.Sum256(pubASN1)
+	return base64.RawURLEncoding.EncodeToString(hash[:8])
 }
 
 func (j *JWTSigner) RotateKey() error {
@@ -265,6 +279,23 @@ func (j *JWTSigner) Sign(userID string) (string, error) {
 		Subject:   userID,
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(1 * time.Hour)),
 		IssuedAt:  jwt.NewNumericDate(time.Now()),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = j.KeyID
+	return token.SignedString(j.PrivateKey)
+}
+
+// --- JWT Signer with Roles/Scopes ---
+
+func (j *JWTSigner) SignWithClaims(userID string, roles []UserRole, scopes []string) (string, error) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	claims := jwt.MapClaims{
+		"sub":    userID,
+		"roles":  roles,
+		"scopes": scopes,
+		"exp":    time.Now().Add(1 * time.Hour).Unix(),
+		"iat":    time.Now().Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = j.KeyID
@@ -320,14 +351,22 @@ type Session struct {
 }
 
 type SessionStore struct {
-	DB *sql.DB
+	DB      *sql.DB
+	hmacKey []byte
+}
+
+func NewSessionStore(db *sql.DB, hmacKey []byte) *SessionStore {
+	return &SessionStore{DB: db, hmacKey: hmacKey}
 }
 
 func (s *SessionStore) Create(ctx context.Context, userID, userAgent, ip string, ttl time.Duration) (Session, error) {
-	id := generateRandomString(32)
-	token := generateSessionToken(id, userID)
+	id, err := generateRandomString(32)
+	if err != nil {
+		return Session{}, err
+	}
+	token := s.generateSessionToken(id, userID)
 	expires := time.Now().Add(ttl)
-	_, err := s.DB.ExecContext(ctx, `
+	_, err = s.DB.ExecContext(ctx, `
 		INSERT INTO sessions(id, user_id, token, user_agent, ip, expires_at, revoked, created_at)
 		VALUES(?,?,?,?,?,?,0,?)
 	`, id, userID, token, userAgent, ip, expires, time.Now())
@@ -358,6 +397,15 @@ func (s *SessionStore) Validate(ctx context.Context, token string) (Session, err
 	if revoked != 0 || time.Now().After(sess.ExpiresAt) {
 		return Session{}, errors.New("session expired or revoked")
 	}
+	// Verify token HMAC
+	parts := strings.Split(sess.Token, ".")
+	if len(parts) != 2 {
+		return Session{}, errors.New("invalid session token format")
+	}
+	expected := s.signSessionToken(parts[0])
+	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expected)) != 1 {
+		return Session{}, errors.New("invalid session token signature")
+	}
 	return sess, nil
 }
 
@@ -371,22 +419,28 @@ func (s *SessionStore) RevokeAllForUser(ctx context.Context, userID string) erro
 	return err
 }
 
-func generateSessionToken(sessionID, userID string) string {
-	// HMAC-based token, not guessable
-	secret := make([]byte, 32)
-	_, _ = rand.Read(secret)
-	h := hmac.New(sha512.New, secret)
-	h.Write([]byte(sessionID + ":" + userID + ":" + fmt.Sprint(time.Now().UnixNano())))
+func (s *SessionStore) generateSessionToken(sessionID, userID string) string {
+	payload := sessionID + ":" + userID + ":" + fmt.Sprint(time.Now().UnixNano())
+	sig := s.signSessionToken(payload)
+	return payload + "." + sig
+}
+
+func (s *SessionStore) signSessionToken(payload string) string {
+	h := hmac.New(sha512.New, s.hmacKey)
+	h.Write([]byte(payload))
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 }
 
-func generateRandomString(n int) string {
+func generateRandomString(n int) (string, error) {
 	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[mathRand.Intn(len(letters))]
+	if _, err := rand.Read(b); err != nil {
+		return "", err
 	}
-	return string(b)
+	for i := range b {
+		b[i] = letters[int(b[i])%len(letters)]
+	}
+	return string(b), nil
 }
 
 // --- Password Reset Token Management ---
@@ -419,7 +473,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, req AuthRequest) (Auth
 		a.Auditor.LogEvent("auth_failed", zap.String("reason", "unsupported_method"))
 		return AuthResult{}, errors.New("unsupported method")
 	}
-	userID, err := store.Authenticate(ctx, req.Credential)
+	userID, err := store.Authenticate(ctx, req.Identifier, req.Secret)
 	if err != nil {
 		a.Auditor.LogEvent("auth_failed", zap.String("reason", err.Error()))
 		return AuthResult{}, err
@@ -509,14 +563,16 @@ func AuthHandler(auth *Authenticator, auditor *AuditLogger, limiter *rateLimiter
 		}
 
 		method := r.Header.Get("X-Auth-Method")
-		cred := r.Header.Get("X-Auth-Credential")
-		if method == "" || cred == "" {
-			writeError(w, "missing auth method or credential", http.StatusBadRequest)
+		identifier := r.Header.Get("X-Auth-Identifier")
+		secret := r.Header.Get("X-Auth-Secret")
+		if method == "" || identifier == "" || secret == "" {
+			writeError(w, "missing auth method, identifier or secret", http.StatusBadRequest)
 			return
 		}
 		res, err := auth.Authenticate(r.Context(), AuthRequest{
 			Method:     method,
-			Credential: cred,
+			Identifier: identifier,
+			Secret:     secret,
 			RemoteIP:   ip,
 			UserAgent:  r.UserAgent(),
 		})
@@ -640,6 +696,12 @@ func FrontendResetPasswordHandler(db *sql.DB, auth *Authenticator) http.HandlerF
 				return
 			}
 			passHash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			reused, _ := checkPasswordReuse(db, userID, string(passHash))
+			if reused {
+				data["Error"] = "Cannot reuse previous passwords"
+				_ = resetTmpl.Execute(w, data)
+				return
+			}
 			_, err := db.Exec(`UPDATE credentials SET secret_hash=? WHERE user_id=? AND type='password'`, string(passHash), userID)
 			if err != nil {
 				data["Error"] = "Could not update password"
@@ -648,6 +710,7 @@ func FrontendResetPasswordHandler(db *sql.DB, auth *Authenticator) http.HandlerF
 			}
 			_, _ = db.Exec(`UPDATE password_resets SET used=1 WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
 			_ = auth.Sessions.RevokeAllForUser(r.Context(), userID)
+			_ = storePasswordHistory(db, userID, string(passHash))
 			data["Success"] = true
 		}
 		_ = resetTmpl.Execute(w, data)
@@ -727,18 +790,23 @@ func FrontendHandler(auth *Authenticator) http.HandlerFunc {
 		data := map[string]interface{}{}
 		if r.Method == http.MethodPost {
 			method := r.FormValue("method")
-			var credential string
+			var identifier, secret string
 			switch method {
 			case "password":
-				credential = r.FormValue("username") + ":" + r.FormValue("password")
+				identifier = r.FormValue("username")
+				secret = r.FormValue("password")
 			case "apikey":
-				credential = "k1:" + r.FormValue("apikey")
+				identifier = "k1"
+				secret = r.FormValue("apikey")
 			case "cognito", "oauth2", "google", "clerk":
-				credential = r.FormValue("username") + ":" + r.FormValue("token")
+				identifier = r.FormValue("username")
+				secret = r.FormValue("token")
 			case "totp":
-				credential = r.FormValue("username") + ":" + r.FormValue("totp")
+				identifier = r.FormValue("username")
+				secret = r.FormValue("totp")
 			case "mfa", "2fa":
-				credential = r.FormValue("username") + ":" + r.FormValue("mfa")
+				identifier = r.FormValue("username")
+				secret = r.FormValue("mfa")
 			default:
 				data["Error"] = "Unsupported method"
 				_ = loginTmpl.Execute(w, data)
@@ -746,7 +814,8 @@ func FrontendHandler(auth *Authenticator) http.HandlerFunc {
 			}
 			res, err := auth.Authenticate(r.Context(), AuthRequest{
 				Method:     method,
-				Credential: credential,
+				Identifier: identifier,
+				Secret:     secret,
 				RemoteIP:   r.RemoteAddr,
 				UserAgent:  r.UserAgent(),
 			})
@@ -758,21 +827,120 @@ func FrontendHandler(auth *Authenticator) http.HandlerFunc {
 				toks := strings.SplitN(res.Token, "|", 2)
 				if len(toks) == 2 {
 					data["SessionToken"] = toks[1]
-					// Set session cookie
-					http.SetCookie(w, &http.Cookie{
-						Name:     "session_token",
-						Value:    toks[1],
-						Path:     "/",
-						HttpOnly: true,
-						Secure:   true,
-						SameSite: http.SameSiteStrictMode,
-						MaxAge:   86400,
-					})
+					setSessionCookie(w, toks[1])
 				}
 			}
 		}
 		_ = loginTmpl.Execute(w, data)
 	}
+}
+
+// --- Middleware for HTTP Timeout ---
+
+func withTimeout(h http.Handler, timeout time.Duration) http.Handler {
+	return http.TimeoutHandler(h, timeout, `{"error":"request timeout"}`)
+}
+
+// --- Main ---
+
+func main() {
+	logger, _ := zap.NewProduction()
+	defer func() {
+		_ = logger.Sync()
+	}()
+	auditor := &AuditLogger{logger}
+
+	signer, err := NewJWTSigner()
+	if err != nil {
+		log.Fatalf("JWT signer error: %v", err)
+	}
+
+	db, err := sql.Open("sqlite3", "store.db")
+	if err != nil {
+		log.Fatalf("DB open error: %v", err)
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+	if err := setupSchema(db); err != nil {
+		log.Fatalf("DB schema error: %v", err)
+	}
+	// NOTE: Ensure setupSchema does not concatenate untrusted input.
+	// setupDemo(db)
+
+	credStore := &SQLCredentialStore{DB: db}
+	credRegistry := &CredentialRegistry{
+		Stores: map[string]CredentialStore{
+			"password": credStore,
+			"apikey":   credStore,
+			"cognito":  credStore,
+			"oauth2":   credStore,
+			"google":   credStore,
+			"clerk":    credStore,
+			"totp":     credStore,
+			"mfa":      credStore,
+			"2fa":      credStore,
+		},
+	}
+
+	// --- Secure static HMAC key for session tokens ---
+	hmacKey := make([]byte, 64)
+	if _, err := rand.Read(hmacKey); err != nil {
+		log.Fatalf("HMAC key gen error: %v", err)
+	}
+	sessionStore := NewSessionStore(db, hmacKey)
+
+	auth := &Authenticator{
+		Credentials: credRegistry,
+		Signer:      signer,
+		Auditor:     auditor,
+		Sessions:    sessionStore,
+	}
+
+	limiter := newRateLimiter(10, 1*time.Minute)
+
+	http.Handle("/auth", withTimeout(http.HandlerFunc(AuthHandler(auth, auditor, limiter)), 10*time.Second))
+	http.Handle("/login", withTimeout(http.HandlerFunc(FrontendHandler(auth)), 10*time.Second))
+	http.Handle("/logout", withTimeout(http.HandlerFunc(LogoutHandler(auth)), 10*time.Second))
+	http.Handle("/forgot-password", withTimeout(http.HandlerFunc(FrontendForgotPasswordHandler(db)), 10*time.Second))
+	http.Handle("/reset-password", withTimeout(http.HandlerFunc(FrontendResetPasswordHandler(db, auth)), 10*time.Second))
+	http.Handle("/change-password", withTimeout(http.HandlerFunc(FrontendChangePasswordHandler(db, auth)), 10*time.Second))
+	http.Handle("/register", withTimeout(RegisterHandler(db, sendEmailSMTP), 10*time.Second))
+	http.Handle("/verify-email", withTimeout(VerifyEmailHandler(db), 10*time.Second))
+	http.Handle("/enroll-totp", withTimeout(EnrollTOTPHandler(db), 10*time.Second))
+	http.Handle("/sessions", withTimeout(ListSessionsHandler(db), 10*time.Second))
+	http.Handle("/revoke-session", withTimeout(RevokeSessionHandler(db), 10*time.Second))
+	logger.Info("Starting server", zap.String("addr", ":8080"))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func storeDemoData(db *sql.DB) {
+	var err error
+	// Demo data
+	pass := "Secret12345@"
+	if err := validatePasswordPolicy(pass); err != nil {
+		log.Fatalf("Demo password policy: %v", err)
+	}
+	passHash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+	_, err = db.Exec(`INSERT INTO users(id, username, email, created_at, updated_at) VALUES(?,?,?,?,?)`,
+		"u1", "alice", "alice@example.com", time.Now(), time.Now())
+	if err != nil {
+		log.Fatalf("Demo user insert error: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+	VALUES(?,?,?,?,?,?,?)`,
+		"c1", "u1", "password", "internal", "alice", string(passHash), time.Now())
+	if err != nil {
+		log.Fatalf("Demo password credential insert error: %v", err)
+	}
+	key, keyHash, _ := generateAPIKey()
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+	VALUES(?,?,?,?,?,?,?)`,
+		"k1", "u1", "apikey", "internal", "k1", keyHash, time.Now())
+	if err != nil {
+		log.Fatalf("Demo apikey credential insert error: %v", err)
+	}
+	fmt.Println("Api Key", key)
 }
 
 var loginTmpl = template.Must(template.New("login").Parse(`
@@ -923,87 +1091,420 @@ var changeTmpl = template.Must(template.New("change").Parse(`
 </html>
 `))
 
-func main() {
-	logger, _ := zap.NewProduction()
-	defer func() {
-		_ = logger.Sync()
-	}()
-	auditor := &AuditLogger{logger}
+// --- Account Lockout & Exponential Backoff ---
 
-	signer, err := NewJWTSigner()
+type FailedLogin struct {
+	UserID    string
+	Count     int
+	LockedAt  time.Time
+	UpdatedAt time.Time
+}
+
+const (
+	maxFailedAttempts      = 5
+	lockoutDuration        = 15 * time.Minute
+	backoffBase            = 2 * time.Second
+	backoffMax             = 30 * time.Second
+	passwordHistoryLength  = 5
+	passwordRotationPeriod = 90 * 24 * time.Hour // 90 days
+)
+
+func recordFailedLogin(db *sql.DB, userID string) error {
+	_, err := db.Exec(`
+		INSERT INTO failed_logins(user_id, count, locked_at, updated_at)
+		VALUES(?,?,?,?)
+		ON CONFLICT(user_id) DO UPDATE SET
+			count = count + 1,
+			updated_at = CURRENT_TIMESTAMP,
+			locked_at = CASE WHEN count+1 >= ? THEN CURRENT_TIMESTAMP ELSE locked_at END
+	`, userID, 1, nil, time.Now(), maxFailedAttempts)
+	return err
+}
+
+func resetFailedLogin(db *sql.DB, userID string) error {
+	_, err := db.Exec(`DELETE FROM failed_logins WHERE user_id=?`, userID)
+	return err
+}
+
+func getFailedLogin(db *sql.DB, userID string) (FailedLogin, error) {
+	var f FailedLogin
+	row := db.QueryRow(`SELECT user_id, count, locked_at, updated_at FROM failed_logins WHERE user_id=?`, userID)
+	err := row.Scan(&f.UserID, &f.Count, &f.LockedAt, &f.UpdatedAt)
+	return f, err
+}
+
+// --- Password History & Rotation ---
+
+func storePasswordHistory(db *sql.DB, userID, hash string) error {
+	_, err := db.Exec(`INSERT INTO password_history(user_id, hash, created_at) VALUES(?,?,?)`, userID, hash, time.Now())
 	if err != nil {
-		log.Fatalf("JWT signer error: %v", err)
+		return err
 	}
+	_, _ = db.Exec(`
+		DELETE FROM password_history
+		WHERE user_id=? AND rowid NOT IN (
+			SELECT rowid FROM password_history WHERE user_id=? ORDER BY created_at DESC LIMIT ?
+		)
+	`, userID, userID, passwordHistoryLength)
+	return nil
+}
 
-	db, err := sql.Open("sqlite3", "store.db")
+func checkPasswordReuse(db *sql.DB, userID, newHash string) (bool, error) {
+	rows, err := db.Query(`SELECT hash FROM password_history WHERE user_id=? ORDER BY created_at DESC LIMIT ?`, userID, passwordHistoryLength)
 	if err != nil {
-		log.Fatalf("DB open error: %v", err)
+		return false, err
 	}
-	defer func() {
-		_ = db.Close()
-	}()
-	if err := setupSchema(db); err != nil {
-		log.Fatalf("DB schema error: %v", err)
+	defer rows.Close()
+	for rows.Next() {
+		var oldHash string
+		if err := rows.Scan(&oldHash); err == nil {
+			if bcrypt.CompareHashAndPassword([]byte(oldHash), []byte(newHash)) == nil {
+				return true, nil
+			}
+		}
 	}
+	return false, nil
+}
 
-	// Demo data
-	pass := "Secret12345@"
-	if err := validatePasswordPolicy(pass); err != nil {
-		log.Fatalf("Demo password policy: %v", err)
+func checkPasswordRotation(db *sql.DB, userID string) (bool, error) {
+	var lastChanged time.Time
+	row := db.QueryRow(`SELECT MAX(created_at) FROM password_history WHERE user_id=?`, userID)
+	if err := row.Scan(&lastChanged); err != nil {
+		return false, err
 	}
-	passHash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
-	_, err = db.Exec(`INSERT INTO users(id, username, email, created_at, updated_at) VALUES(?,?,?,?,?)`,
-		"u1", "alice", "alice@example.com", time.Now(), time.Now())
+	return time.Since(lastChanged) > passwordRotationPeriod, nil
+}
+
+// --- Email Verification & MFA Enrollment ---
+
+func markEmailVerified(db *sql.DB, userID string) error {
+	_, err := db.Exec(`UPDATE users SET email_verified=1 WHERE id=?`, userID)
+	return err
+}
+
+func isEmailVerified(db *sql.DB, userID string) (bool, error) {
+	var verified int
+	row := db.QueryRow(`SELECT email_verified FROM users WHERE id=?`, userID)
+	if err := row.Scan(&verified); err != nil {
+		return false, err
+	}
+	return verified == 1, nil
+}
+
+func enrollTOTP(db *sql.DB, userID, secret string) error {
+	_, err := db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, metadata, created_at)
+		VALUES(?,?,?,?,?,?,?,?)`,
+		"totp-"+userID, userID, "totp", "internal", userID, "", `{"secret":"`+secret+`"}`, time.Now())
+	return err
+}
+
+// --- Refresh Tokens & Revocation ---
+
+type RefreshToken struct {
+	ID        string
+	UserID    string
+	Token     string
+	ExpiresAt time.Time
+	Revoked   bool
+	CreatedAt time.Time
+}
+
+func generateRefreshToken() (string, string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", err
+	}
+	token := base64.RawURLEncoding.EncodeToString(raw)
+	hash := sha256.Sum256([]byte(token))
+	return token, base64.StdEncoding.EncodeToString(hash[:]), nil
+}
+
+func storeRefreshToken(db *sql.DB, userID, tokenHash string, expires time.Time) error {
+	_, err := db.Exec(`INSERT INTO refresh_tokens(user_id, token_hash, expires_at, revoked, created_at) VALUES(?,?,?,?,?)`,
+		userID, tokenHash, expires, 0, time.Now())
+	return err
+}
+
+func revokeRefreshToken(db *sql.DB, tokenHash string) error {
+	_, err := db.Exec(`UPDATE refresh_tokens SET revoked=1 WHERE token_hash=?`, tokenHash)
+	return err
+}
+
+func validateRefreshToken(db *sql.DB, token string) (string, error) {
+	hash := sha256.Sum256([]byte(token))
+	var userID string
+	var expires time.Time
+	var revoked int
+	row := db.QueryRow(`SELECT user_id, expires_at, revoked FROM refresh_tokens WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
+	if err := row.Scan(&userID, &expires, &revoked); err != nil || revoked != 0 || time.Now().After(expires) {
+		return "", errors.New("invalid or expired refresh token")
+	}
+	return userID, nil
+}
+
+// --- Secure Cookie Attributes ---
+
+func setSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		// Domain: "yourdomain.com", // Set if needed
+		MaxAge: 86400,
+	})
+}
+
+// --- Refresh Token Endpoint Example ---
+
+func RefreshTokenHandler(auth *Authenticator, db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		refresh := r.FormValue("refresh_token")
+		if refresh == "" {
+			writeError(w, "missing refresh token", http.StatusBadRequest)
+			return
+		}
+		userID, err := validateRefreshToken(db, refresh)
+		if err != nil {
+			writeError(w, "invalid refresh token", http.StatusUnauthorized)
+			return
+		}
+		token, err := auth.Signer.Sign(userID)
+		if err != nil {
+			writeError(w, "token error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": token})
+	}
+}
+
+// --- RBAC & Scopes ---
+
+type UserRole string
+
+const (
+	RoleUser  UserRole = "user"
+	RoleAdmin UserRole = "admin"
+	// ...add more as needed
+)
+
+type User struct {
+	ID            string
+	Username      string
+	Email         string
+	EmailVerified bool
+	Roles         []UserRole
+	// ...existing fields...
+}
+
+// --- User Registration & Email Verification ---
+
+func RegisterHandler(db *sql.DB, sendEmail func(to, subject, html string) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		username := r.FormValue("username")
+		email := r.FormValue("email")
+		password := r.FormValue("password")
+		if username == "" || email == "" || password == "" {
+			writeError(w, "missing fields", http.StatusBadRequest)
+			return
+		}
+		if err := validatePasswordPolicy(password); err != nil {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		passHash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		userID := generateUserID(username)
+		_, err := db.Exec(`INSERT INTO users(id, username, email, email_verified, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+			userID, username, email, 0, time.Now(), time.Now())
+		if err != nil {
+			writeError(w, "user exists", http.StatusConflict)
+			return
+		}
+		_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+			VALUES(?,?,?,?,?,?,?)`,
+			"c-"+userID, userID, "password", "internal", username, string(passHash), time.Now())
+		if err != nil {
+			writeError(w, "credential error", http.StatusInternalServerError)
+			return
+		}
+		// Email verification token
+		token, hash := generateResetToken()
+		_, _ = db.Exec(`INSERT INTO email_verifications(user_id, token_hash, expires_at, used) VALUES(?,?,?,0)`,
+			userID, hash, time.Now().Add(24*time.Hour))
+		// Send email (stub)
+		_ = sendEmail(email, "Verify your account", fmt.Sprintf("Click to verify: https://yourdomain/verify-email?token=%s", token))
+		w.WriteHeader(http.StatusCreated)
+	}
+}
+
+func VerifyEmailHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			writeError(w, "missing token", http.StatusBadRequest)
+			return
+		}
+		hash := sha256.Sum256([]byte(token))
+		var userID string
+		var expires time.Time
+		var used int
+		row := db.QueryRow(`SELECT user_id, expires_at, used FROM email_verifications WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
+		if err := row.Scan(&userID, &expires, &used); err != nil || used != 0 || time.Now().After(expires) {
+			writeError(w, "invalid or expired token", http.StatusBadRequest)
+			return
+		}
+		_ = markEmailVerified(db, userID)
+		_, _ = db.Exec(`UPDATE email_verifications SET used=1 WHERE token_hash=?`, base64.StdEncoding.EncodeToString(hash[:]))
+		w.Write([]byte("Email verified!"))
+	}
+}
+
+// --- MFA Enrollment (TOTP) ---
+
+func EnrollTOTPHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID := r.FormValue("user_id")
+		if userID == "" {
+			writeError(w, "missing user_id", http.StatusBadRequest)
+			return
+		}
+		secret := generateTOTPSecret() // stub, use otp.NewKey()
+		_ = enrollTOTP(db, userID, secret)
+		// Show QR code or secret to user (not implemented here)
+		w.Write([]byte(fmt.Sprintf("TOTP secret: %s", secret)))
+	}
+}
+
+// --- Password Reset via Email (SMTP/SES stub) ---
+
+func sendEmailSMTP(to, subject, html string) error {
+	// Integrate with SMTP/SES/SendGrid here
+	return nil
+}
+
+// --- Session Concurrency & Device Management ---
+
+func ListSessionsHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID := r.FormValue("user_id")
+		rows, err := db.Query(`SELECT id, user_agent, ip, created_at, expires_at, revoked FROM sessions WHERE user_id=?`, userID)
+		if err != nil {
+			writeError(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		var sessions []map[string]interface{}
+		for rows.Next() {
+			var id, ua, ip string
+			var created, expires time.Time
+			var revoked int
+			_ = rows.Scan(&id, &ua, &ip, &created, &expires, &revoked)
+			sessions = append(sessions, map[string]interface{}{
+				"id": id, "user_agent": ua, "ip": ip, "created_at": created, "expires_at": expires, "revoked": revoked != 0,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(sessions)
+	}
+}
+
+func RevokeSessionHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.FormValue("session_id")
+		_, err := db.Exec(`UPDATE sessions SET revoked=1 WHERE id=?`, sessionID)
+		if err != nil {
+			writeError(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// --- Audit Trail: Async Logging (stub, replace with ELK/CloudWatch/other) ---
+
+type AuditEvent struct {
+	Event  string
+	Fields []zap.Field
+	Time   time.Time
+}
+
+type AsyncAuditLogger struct {
+	ch chan AuditEvent
+}
+
+func NewAsyncAuditLogger() *AsyncAuditLogger {
+	return &AsyncAuditLogger{ch: make(chan AuditEvent, 1000)}
+}
+
+func (a *AsyncAuditLogger) LogEvent(event string, fields ...zap.Field) {
+	a.ch <- AuditEvent{Event: event, Fields: fields, Time: time.Now()}
+}
+
+// --- Distributed Rate Limiting (stub, use Redis or Envoy) ---
+
+type DistributedRateLimiter struct {
+	// Use Redis or external service
+}
+
+func (r *DistributedRateLimiter) Allow(ip string) bool {
+	// Implement Redis-based rate limiting here
+	return true
+}
+
+// --- OIDC/JWK Caching (stub) ---
+
+type CachedKeySet struct {
+	ks    oidc.KeySet
+	exp   time.Time
+	mutex sync.Mutex
+}
+
+func NewCachedKeySet(issuer string) *CachedKeySet {
+	return &CachedKeySet{}
+}
+
+func (c *CachedKeySet) Verify(ctx context.Context, token string) (*oidc.IDToken, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if time.Now().After(c.exp) {
+		// Fetch and cache new keys, set c.exp from Cache-Control header
+	}
+	return nil, nil // implement actual verification
+}
+
+// --- DB Connection Pooling & Prepared Statements ---
+
+func setupDB(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
-		log.Fatalf("Demo user insert error: %v", err)
+		return nil, err
 	}
-	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
-		VALUES(?,?,?,?,?,?,?)`,
-		"c1", "u1", "password", "internal", "alice", string(passHash), time.Now())
-	if err != nil {
-		log.Fatalf("Demo password credential insert error: %v", err)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(1 * time.Hour)
+	// Prepare statements here and store in struct for reuse
+	return db, nil
+}
+
+func generateTOTPSecret() string {
+	// Generates a random 20-byte base32 secret for TOTP
+	secret := make([]byte, 20)
+	if _, err := rand.Read(secret); err != nil {
+		return ""
 	}
-	key, keyHash, _ := generateAPIKey()
-	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
-		VALUES(?,?,?,?,?,?,?)`,
-		"k1", "u1", "apikey", "internal", "k1", keyHash, time.Now())
-	if err != nil {
-		log.Fatalf("Demo apikey credential insert error: %v", err)
-	}
-	fmt.Println("Api Key", key)
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(secret)
+}
 
-	credStore := &SQLCredentialStore{DB: db}
-	credRegistry := &CredentialRegistry{
-		Stores: map[string]CredentialStore{
-			"password": credStore,
-			"apikey":   credStore,
-			"cognito":  credStore,
-			"oauth2":   credStore,
-			"google":   credStore,
-			"clerk":    credStore,
-			"totp":     credStore,
-			"mfa":      credStore,
-			"2fa":      credStore,
-		},
-	}
-
-	sessionStore := &SessionStore{DB: db}
-
-	auth := &Authenticator{
-		Credentials: credRegistry,
-		Signer:      signer,
-		Auditor:     auditor,
-		Sessions:    sessionStore,
-	}
-
-	limiter := newRateLimiter(10, 1*time.Minute)
-
-	http.HandleFunc("/auth", AuthHandler(auth, auditor, limiter))
-	http.HandleFunc("/login", FrontendHandler(auth))
-	http.HandleFunc("/logout", LogoutHandler(auth))
-	http.HandleFunc("/forgot-password", FrontendForgotPasswordHandler(db))
-	http.HandleFunc("/reset-password", FrontendResetPasswordHandler(db, auth))
-	http.HandleFunc("/change-password", FrontendChangePasswordHandler(db, auth))
-	logger.Info("Starting server", zap.String("addr", ":8080"))
-	log.Fatal(http.ListenAndServe(":8080", nil))
+func generateUserID(username string) string {
+	// Generates a unique user ID based on username and current time
+	h := sha256.New()
+	h.Write([]byte(username))
+	h.Write([]byte(fmt.Sprint(time.Now().UnixNano())))
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))[:16]
 }
