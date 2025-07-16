@@ -2,7 +2,41 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
+	"log"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
+
+func storeDemoData(db *sql.DB) {
+	var err error
+	// Demo data
+	pass := "Secret12345@"
+	if err := validatePasswordPolicy(pass); err != nil {
+		log.Fatalf("Demo password policy: %v", err)
+	}
+	passHash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+	_, err = db.Exec(`INSERT INTO users(id, username, email, created_at, updated_at) VALUES(?,?,?,?,?)`,
+		"u1", "alice", "alice@example.com", time.Now(), time.Now())
+	if err != nil {
+		log.Fatalf("Demo user insert error: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+	VALUES(?,?,?,?,?,?,?)`,
+		"c1", "u1", "password", "internal", "alice", string(passHash), time.Now())
+	if err != nil {
+		log.Fatalf("Demo password credential insert error: %v", err)
+	}
+	key, keyHash, _ := generateAPIKey()
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+	VALUES(?,?,?,?,?,?,?)`,
+		"k1", "u1", "apikey", "internal", "k1", keyHash, time.Now())
+	if err != nil {
+		log.Fatalf("Demo apikey credential insert error: %v", err)
+	}
+	fmt.Println("Api Key", key)
+}
 
 func setupSchema(db *sql.DB) error {
 	_, err := db.Exec(`
