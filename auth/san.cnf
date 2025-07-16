@@ -1,8 +1,9 @@
 [req]
 default_bits       = 2048
+prompt             = no
+default_md         = sha256
 distinguished_name = req_distinguished_name
 req_extensions     = req_ext
-prompt             = no
 
 [req_distinguished_name]
 C  = US
@@ -13,6 +14,7 @@ OU = Unit
 CN = localhost
 
 [req_ext]
+# Subject Alternative Names
 subjectAltName = @alt_names
 
 [alt_names]

@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Change Password</title>
+</head>
+
+<body>
+    <div class="form-box">
+        <h2>Change Password</h2>
+        {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+        {{if .Success}}
+        <div>Password changed. Please <a href="/login">login</a> again.</div>
+        {{else}}
+        <form method="POST">
+            <label>Session Token: <input type="text" name="session_token"></label><br>
+            <label>Old Password: <input type="password" name="old_password"></label><br>
+            <label>New Password: <input type="password" name="new_password"></label><br>
+            <button type="submit">Change Password</button>
+        </form>
+        {{end}}
+    </div>
+</body>
+
+</html>

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Login</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #f7f7f7;
+        }
+
+        .form-box {
+            background: #fff;
+            padding: 2em;
+            margin: 2em auto;
+            max-width: 400px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px #ccc;
+        }
+
+        .error {
+            color: #b00;
+        }
+
+        .token {
+            word-break: break-all;
+            background: #eee;
+            padding: 0.5em;
+        }
+    </style>
+    <script>
+        function onProviderChange() {
+            var method = document.getElementById('method').value;
+            document.getElementById('username-row').style.display = (method === 'password') ? '' : 'none';
+            document.getElementById('password-row').style.display = (method === 'password') ? '' : 'none';
+            document.getElementById('apikey-row').style.display = (method === 'apikey') ? '' : 'none';
+            document.getElementById('token-row').style.display = (['oauth2', 'google', 'clerk', 'cognito'].includes(method)) ? '' : 'none';
+            document.getElementById('totp-row').style.display = (method === 'totp') ? '' : 'none';
+            document.getElementById('mfa-row').style.display = (['mfa', '2fa'].includes(method)) ? '' : 'none';
+        }
+    </script>
+</head>
+
+<body>
+    <div class="form-box">
+        <h2>Login</h2>
+        {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+        {{if .Token}}
+        <div>Login successful! JWT:</div>
+        <div class="token">{{.Token}}</div>
+        <br>
+        <form method="POST" action="/logout">
+            <input type="hidden" name="session_token" value="{{.SessionToken}}">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <button type="submit">Logout</button>
+        </form>
+        <br>
+        <a href="/change-password">Change Password</a>
+        {{else}}
+        <form method="POST" autocomplete="off">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <label for="method">Provider:</label>
+            <select name="method" id="method" onchange="onProviderChange()">
+                <option value="password">Password</option>
+                <option value="apikey">API Key</option>
+                <option value="cognito">AWS Cognito</option>
+                <option value="oauth2">OAuth2 (Generic)</option>
+                <option value="google">Google OAuth2</option>
+                <option value="clerk">Clerk</option>
+                <option value="totp">TOTP</option>
+                <option value="mfa">MultiDevice MFA</option>
+                <option value="2fa">2FA</option>
+            </select>
+            <div id="username-row">
+                <label>Username: <input type="text" name="username" autocomplete="username"></label>
+            </div>
+            <div id="password-row">
+                <label>Password: <input type="password" name="password" autocomplete="current-password"></label>
+            </div>
+            <div id="apikey-row" style="display:none">
+                <label>API Key: <input type="text" name="apikey"></label>
+            </div>
+            <div id="token-row" style="display:none">
+                <label>Token: <input type="text" name="token"></label>
+            </div>
+            <div id="totp-row" style="display:none">
+                <label>TOTP Code: <input type="text" name="totp"></label>
+            </div>
+            <div id="mfa-row" style="display:none">
+                <label>MFA/2FA Code: <input type="text" name="mfa"></label>
+            </div>
+            <br>
+            <button type="submit">Login</button>
+        </form>
+        <a href="/forgot-password">Forgot Password?</a>
+        <script>onProviderChange();</script>
+        {{end}}
+    </div>
+</body>
+
+</html>

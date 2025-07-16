@@ -477,7 +477,8 @@ type User struct {
 // --- Password Reset via Email (SMTP/SES stub) ---
 
 func sendEmailSMTP(to, subject, html string) error {
-	// Integrate with SMTP/SES/SendGrid here
+	// For demo: log email sending. Replace with SMTP/SES/SendGrid integration for production.
+	log.Printf("Sending email to %s: %s\n%s\n", to, subject, html)
 	return nil
 }
 
@@ -625,6 +626,9 @@ func main() {
 	http.Handle("/enroll-totp", securityMiddleware(csrfMiddleware(withTimeout(EnrollTOTPHandler(db), 10*time.Second))))
 	http.Handle("/sessions", securityMiddleware(csrfMiddleware(withTimeout(ListSessionsHandler(db), 10*time.Second))))
 	http.Handle("/revoke-session", securityMiddleware(csrfMiddleware(withTimeout(RevokeSessionHandler(db), 10*time.Second))))
+	http.Handle("/refresh-token", securityMiddleware(csrfMiddleware(withTimeout(
+		RefreshTokenHandler(auth, db), 10*time.Second))))
+
 	logger.Info("Starting server", zap.String("addr", ":8080"))
 	if _, err := os.Stat("server.crt"); os.IsNotExist(err) {
 		log.Println("TLS certificate 'server.crt' not found. Generate with:")
@@ -634,5 +638,34 @@ func main() {
 		log.Println("TLS key 'server.key' not found. Generate with:")
 		log.Println("  openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes -subj '/CN=localhost'")
 	}
+	log.Fatal(http.ListenAndServeTLS(":8080", "server.crt", "server.key", nil))
+	// Ensure template directory exists
+	if _, err := os.Stat("./templates"); os.IsNotExist(err) {
+		log.Fatalf("Template directory './templates' not found")
+	}
+	RegisterHTMLRoutes()
+
+	// --- Use isEmailVerified in registration flow as example ---
+	// Optionally, you can enforce email verification before allowing login or sensitive actions.
+	// Example usage in registration handler or login handler:
+	// verified, err := isEmailVerified(db, userID)
+	// if err != nil || !verified { ... }
+
+	// --- Add refresh token endpoint ---
+	http.Handle("/refresh-token", securityMiddleware(csrfMiddleware(withTimeout(
+		RefreshTokenHandler(auth, db), 10*time.Second))))
+
+	// Example usage of generate/store/revoke refresh token:
+	// When issuing a refresh token after login:
+	// refreshToken, refreshHash, err := generateRefreshToken()
+	// if err == nil {
+	//     _ = storeRefreshToken(db, userID, refreshHash, time.Now().Add(7*24*time.Hour))
+	//     // Return refreshToken to client
+	// }
+	// When revoking:
+	// _ = revokeRefreshToken(db, refreshHash)
+
+	// ...existing code...
+
 	log.Fatal(http.ListenAndServeTLS(":8080", "server.crt", "server.key", nil))
 }

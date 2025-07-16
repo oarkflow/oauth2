@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Reset Password</title>
+</head>
+
+<body>
+    <div class="form-box">
+        <h2>Reset Password</h2>
+        {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+        {{if .Success}}
+        <div>Password reset successful. <a href="/login">Login</a></div>
+        {{else}}
+        <form method="POST">
+            <label>Reset Token: <input type="text" name="token"></label><br>
+            <label>New Password: <input type="password" name="password"></label><br>
+            <button type="submit">Reset Password</button>
+        </form>
+        {{end}}
+    </div>
+</body>
+
+</html>
