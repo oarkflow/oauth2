@@ -19,10 +19,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
-
+	
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
 	"github.com/coreos/go-oidc"
@@ -78,7 +79,7 @@ func (s *SQLCredentialStore) Authenticate(ctx context.Context, identifier, secre
 	if err != nil {
 		return "", errors.New("credential not found")
 	}
-
+	
 	// Account lockout check
 	if typ == "password" {
 		failed, err := getFailedLogin(s.DB, identifier)
@@ -86,7 +87,7 @@ func (s *SQLCredentialStore) Authenticate(ctx context.Context, identifier, secre
 			return "", errors.New("account locked due to too many failed attempts")
 		}
 	}
-
+	
 	switch typ {
 	case "password":
 		if err := bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(secret)); err != nil {
@@ -546,12 +547,12 @@ func AuthHandler(auth *Authenticator, auditor *AuditLogger, limiter *rateLimiter
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "X-Auth-Method, X-Auth-Credential, X-Auth-Provider, Content-Type")
-
+		
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-
+		
 		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 		if ip == "" {
 			ip = r.RemoteAddr
@@ -561,7 +562,7 @@ func AuthHandler(auth *Authenticator, auditor *AuditLogger, limiter *rateLimiter
 			http.Error(w, "Too many requests", http.StatusTooManyRequests)
 			return
 		}
-
+		
 		method := r.Header.Get("X-Auth-Method")
 		identifier := r.Header.Get("X-Auth-Identifier")
 		secret := r.Header.Get("X-Auth-Secret")
@@ -788,6 +789,12 @@ func FrontendChangePasswordHandler(db *sql.DB, auth *Authenticator) http.Handler
 func FrontendHandler(auth *Authenticator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		data := map[string]interface{}{}
+		// Pass CSRF token to template
+		if token, ok := r.Context().Value("csrf_token").(string); ok {
+			data["CSRFToken"] = token
+		} else if cookie, err := r.Cookie("csrf_token"); err == nil {
+			data["CSRFToken"] = cookie.Value
+		}
 		if r.Method == http.MethodPost {
 			method := r.FormValue("method")
 			var identifier, secret string
@@ -841,107 +848,126 @@ func withTimeout(h http.Handler, timeout time.Duration) http.Handler {
 	return http.TimeoutHandler(h, timeout, `{"error":"request timeout"}`)
 }
 
-// --- Main ---
+// --- Provider Interface for Extensibility ---
 
-func main() {
-	logger, _ := zap.NewProduction()
-	defer func() {
-		_ = logger.Sync()
-	}()
-	auditor := &AuditLogger{logger}
-
-	signer, err := NewJWTSigner()
-	if err != nil {
-		log.Fatalf("JWT signer error: %v", err)
-	}
-
-	db, err := sql.Open("sqlite3", "store.db")
-	if err != nil {
-		log.Fatalf("DB open error: %v", err)
-	}
-	defer func() {
-		_ = db.Close()
-	}()
-	if err := setupSchema(db); err != nil {
-		log.Fatalf("DB schema error: %v", err)
-	}
-	// NOTE: Ensure setupSchema does not concatenate untrusted input.
-	// setupDemo(db)
-
-	credStore := &SQLCredentialStore{DB: db}
-	credRegistry := &CredentialRegistry{
-		Stores: map[string]CredentialStore{
-			"password": credStore,
-			"apikey":   credStore,
-			"cognito":  credStore,
-			"oauth2":   credStore,
-			"google":   credStore,
-			"clerk":    credStore,
-			"totp":     credStore,
-			"mfa":      credStore,
-			"2fa":      credStore,
-		},
-	}
-
-	// --- Secure static HMAC key for session tokens ---
-	hmacKey := make([]byte, 64)
-	if _, err := rand.Read(hmacKey); err != nil {
-		log.Fatalf("HMAC key gen error: %v", err)
-	}
-	sessionStore := NewSessionStore(db, hmacKey)
-
-	auth := &Authenticator{
-		Credentials: credRegistry,
-		Signer:      signer,
-		Auditor:     auditor,
-		Sessions:    sessionStore,
-	}
-
-	limiter := newRateLimiter(10, 1*time.Minute)
-
-	http.Handle("/auth", withTimeout(http.HandlerFunc(AuthHandler(auth, auditor, limiter)), 10*time.Second))
-	http.Handle("/login", withTimeout(http.HandlerFunc(FrontendHandler(auth)), 10*time.Second))
-	http.Handle("/logout", withTimeout(http.HandlerFunc(LogoutHandler(auth)), 10*time.Second))
-	http.Handle("/forgot-password", withTimeout(http.HandlerFunc(FrontendForgotPasswordHandler(db)), 10*time.Second))
-	http.Handle("/reset-password", withTimeout(http.HandlerFunc(FrontendResetPasswordHandler(db, auth)), 10*time.Second))
-	http.Handle("/change-password", withTimeout(http.HandlerFunc(FrontendChangePasswordHandler(db, auth)), 10*time.Second))
-	http.Handle("/register", withTimeout(RegisterHandler(db, sendEmailSMTP), 10*time.Second))
-	http.Handle("/verify-email", withTimeout(VerifyEmailHandler(db), 10*time.Second))
-	http.Handle("/enroll-totp", withTimeout(EnrollTOTPHandler(db), 10*time.Second))
-	http.Handle("/sessions", withTimeout(ListSessionsHandler(db), 10*time.Second))
-	http.Handle("/revoke-session", withTimeout(RevokeSessionHandler(db), 10*time.Second))
-	logger.Info("Starting server", zap.String("addr", ":8080"))
-	log.Fatal(http.ListenAndServe(":8080", nil))
+type Provider interface {
+	Authenticate(ctx context.Context, identifier, secret string, config map[string]interface{}) (string, error)
 }
 
-func storeDemoData(db *sql.DB) {
-	var err error
-	// Demo data
-	pass := "Secret12345@"
-	if err := validatePasswordPolicy(pass); err != nil {
-		log.Fatalf("Demo password policy: %v", err)
-	}
-	passHash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
-	_, err = db.Exec(`INSERT INTO users(id, username, email, created_at, updated_at) VALUES(?,?,?,?,?)`,
-		"u1", "alice", "alice@example.com", time.Now(), time.Now())
-	if err != nil {
-		log.Fatalf("Demo user insert error: %v", err)
-	}
-	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
-	VALUES(?,?,?,?,?,?,?)`,
-		"c1", "u1", "password", "internal", "alice", string(passHash), time.Now())
-	if err != nil {
-		log.Fatalf("Demo password credential insert error: %v", err)
-	}
-	key, keyHash, _ := generateAPIKey()
-	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
-	VALUES(?,?,?,?,?,?,?)`,
-		"k1", "u1", "apikey", "internal", "k1", keyHash, time.Now())
-	if err != nil {
-		log.Fatalf("Demo apikey credential insert error: %v", err)
-	}
-	fmt.Println("Api Key", key)
+type ProviderRegistry struct {
+	Providers map[string]Provider
 }
+
+func (r *ProviderRegistry) Get(name string) (Provider, error) {
+	p, ok := r.Providers[name]
+	if !ok {
+		return nil, errors.New("unsupported provider")
+	}
+	return p, nil
+}
+
+// --- Example Provider Implementation (Password) ---
+
+type PasswordProvider struct {
+	DB *sql.DB
+}
+
+func (p *PasswordProvider) Authenticate(ctx context.Context, identifier, secret string, config map[string]interface{}) (string, error) {
+	// Use prepared statement for security
+	stmt, err := p.DB.PrepareContext(ctx, `
+		SELECT user_id, secret_hash FROM credentials WHERE identifier=? AND type='password'
+	`)
+	if err != nil {
+		return "", errors.New("db error")
+	}
+	defer stmt.Close()
+	var userID, secretHash string
+	err = stmt.QueryRow(identifier).Scan(&userID, &secretHash)
+	if err != nil {
+		return "", errors.New("credential not found")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(secret)); err != nil {
+		return "", errors.New("unauthorized")
+	}
+	return userID, nil
+}
+
+// --- Security Middleware ---
+
+func securityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Enforce HTTPS
+		if r.TLS == nil {
+			http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusMovedPermanently)
+			return
+		}
+		// Security headers
+		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
+		// CORS (restrict to allowed origins)
+		w.Header().Set("Access-Control-Allow-Origin", "https://yourdomain.com")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "X-Auth-Method, X-Auth-Identifier, X-Auth-Secret, Content-Type")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- CSRF Token Utilities ---
+
+func generateCSRFToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// --- CSRF Protection Middleware (improved) ---
+
+func csrfMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CSRF cookie on GET requests
+		if r.Method == http.MethodGet {
+			token := generateCSRFToken()
+			http.SetCookie(w, &http.Cookie{
+				Name:     "csrf_token",
+				Value:    token,
+				Path:     "/",
+				HttpOnly: false,
+				Secure:   true,
+				SameSite: http.SameSiteStrictMode,
+				MaxAge:   3600,
+			})
+			// Also set in context for templates
+			ctx := context.WithValue(r.Context(), "csrf_token", token)
+			r = r.WithContext(ctx)
+		}
+		// Enforce CSRF only for browser forms (not for /auth API)
+		if r.Method == http.MethodPost && !strings.HasPrefix(r.URL.Path, "/auth") {
+			csrfToken := r.Header.Get("X-CSRF-Token")
+			if csrfToken == "" {
+				csrfToken = r.FormValue("csrf_token")
+			}
+			cookie, err := r.Cookie("csrf_token")
+			if err != nil || csrfToken == "" || csrfToken != cookie.Value {
+				log.Printf("CSRF token invalid: header/form=%q cookie=%q", csrfToken, func() string {
+					if err == nil {
+						return cookie.Value
+					}
+					return ""
+				}())
+				http.Error(w, "CSRF token invalid", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Update loginTmpl to include CSRF token in form ---
 
 var loginTmpl = template.Must(template.New("login").Parse(`
 <!DOCTYPE html>
@@ -976,12 +1002,14 @@ var loginTmpl = template.Must(template.New("login").Parse(`
 			<br>
 			<form method="POST" action="/logout">
 				<input type="hidden" name="session_token" value="{{.SessionToken}}">
+				<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
 				<button type="submit">Logout</button>
 			</form>
 			<br>
 			<a href="/change-password">Change Password</a>
 		{{else}}
 		<form method="POST" autocomplete="off">
+			<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
 			<label for="method">Provider:</label>
 			<select name="method" id="method" onchange="onProviderChange()">
 				<option value="password">Password</option>
@@ -1507,4 +1535,106 @@ func generateUserID(username string) string {
 	h.Write([]byte(username))
 	h.Write([]byte(fmt.Sprint(time.Now().UnixNano())))
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))[:16]
+}
+
+func main() {
+	logger, _ := zap.NewProduction()
+	defer func() {
+		_ = logger.Sync()
+	}()
+	auditor := &AuditLogger{logger}
+	
+	signer, err := NewJWTSigner()
+	if err != nil {
+		log.Fatalf("JWT signer error: %v", err)
+	}
+	
+	db, err := setupDB("store.db")
+	if err != nil {
+		log.Fatalf("DB open error: %v", err)
+	}
+	defer db.Close()
+	setupSchema(db)
+	// Setup credential registry for extensibility
+	credentialRegistry := &CredentialRegistry{
+		Stores: map[string]CredentialStore{
+			"password": &SQLCredentialStore{DB: db},
+			"apikey":   &SQLCredentialStore{DB: db},
+			"cognito":  &SQLCredentialStore{DB: db},
+			"oauth2":   &SQLCredentialStore{DB: db},
+			"google":   &SQLCredentialStore{DB: db},
+			"clerk":    &SQLCredentialStore{DB: db},
+			"totp":     &SQLCredentialStore{DB: db},
+			"mfa":      &SQLCredentialStore{DB: db},
+			"2fa":      &SQLCredentialStore{DB: db},
+		},
+	}
+	
+	// Secure HMAC key for sessions
+	hmacKey := make([]byte, 64)
+	if _, err := rand.Read(hmacKey); err != nil {
+		log.Fatalf("HMAC key gen error: %v", err)
+	}
+	sessionStore := NewSessionStore(db, hmacKey)
+	
+	auth := &Authenticator{
+		Credentials: credentialRegistry,
+		Signer:      signer,
+		Auditor:     auditor,
+		Sessions:    sessionStore,
+	}
+	
+	limiter := newRateLimiter(10, 1*time.Minute)
+	
+	// Secure endpoints with middleware
+	http.Handle("/auth", securityMiddleware(csrfMiddleware(withTimeout(AuthHandler(auth, auditor, limiter), 10*time.Second))))
+	http.Handle("/login", securityMiddleware(csrfMiddleware(withTimeout(FrontendHandler(auth), 10*time.Second))))
+	http.Handle("/logout", securityMiddleware(csrfMiddleware(withTimeout(LogoutHandler(auth), 10*time.Second))))
+	http.Handle("/forgot-password", securityMiddleware(csrfMiddleware(withTimeout(FrontendForgotPasswordHandler(db), 10*time.Second))))
+	http.Handle("/reset-password", securityMiddleware(csrfMiddleware(withTimeout(FrontendResetPasswordHandler(db, auth), 10*time.Second))))
+	http.Handle("/change-password", securityMiddleware(csrfMiddleware(withTimeout(FrontendChangePasswordHandler(db, auth), 10*time.Second))))
+	http.Handle("/register", securityMiddleware(csrfMiddleware(withTimeout(RegisterHandler(db, sendEmailSMTP), 10*time.Second))))
+	http.Handle("/verify-email", securityMiddleware(csrfMiddleware(withTimeout(VerifyEmailHandler(db), 10*time.Second))))
+	http.Handle("/enroll-totp", securityMiddleware(csrfMiddleware(withTimeout(EnrollTOTPHandler(db), 10*time.Second))))
+	http.Handle("/sessions", securityMiddleware(csrfMiddleware(withTimeout(ListSessionsHandler(db), 10*time.Second))))
+	http.Handle("/revoke-session", securityMiddleware(csrfMiddleware(withTimeout(RevokeSessionHandler(db), 10*time.Second))))
+	logger.Info("Starting server", zap.String("addr", ":8080"))
+	if _, err := os.Stat("server.crt"); os.IsNotExist(err) {
+		log.Println("TLS certificate 'server.crt' not found. Generate with:")
+		log.Println("  openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes -subj '/CN=localhost'")
+	}
+	if _, err := os.Stat("server.key"); os.IsNotExist(err) {
+		log.Println("TLS key 'server.key' not found. Generate with:")
+		log.Println("  openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes -subj '/CN=localhost'")
+	}
+	log.Fatal(http.ListenAndServeTLS(":8080", "server.crt", "server.key", nil))
+}
+
+func storeDemoData(db *sql.DB) {
+	var err error
+	// Demo data
+	pass := "Secret12345@"
+	if err := validatePasswordPolicy(pass); err != nil {
+		log.Fatalf("Demo password policy: %v", err)
+	}
+	passHash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+	_, err = db.Exec(`INSERT INTO users(id, username, email, created_at, updated_at) VALUES(?,?,?,?,?)`,
+		"u1", "alice", "alice@example.com", time.Now(), time.Now())
+	if err != nil {
+		log.Fatalf("Demo user insert error: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+	VALUES(?,?,?,?,?,?,?)`,
+		"c1", "u1", "password", "internal", "alice", string(passHash), time.Now())
+	if err != nil {
+		log.Fatalf("Demo password credential insert error: %v", err)
+	}
+	key, keyHash, _ := generateAPIKey()
+	_, err = db.Exec(`INSERT INTO credentials(id, user_id, type, provider, identifier, secret_hash, created_at)
+	VALUES(?,?,?,?,?,?,?)`,
+		"k1", "u1", "apikey", "internal", "k1", keyHash, time.Now())
+	if err != nil {
+		log.Fatalf("Demo apikey credential insert error: %v", err)
+	}
+	fmt.Println("Api Key", key)
 }
